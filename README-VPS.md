@@ -5,13 +5,13 @@
 ## 1. رفع المشروع إلى السيرفر
 
 ```bash
-scp -r codentra-vps-mongodb root@YOUR_VPS_IP:/root/
+ssh root@YOUR_VPS_IP
+git clone https://github.com/ahmedsamir55434/codentra.git /root/codentra-vps-mongodb
 ```
 
 ## 2. تثبيت المتطلبات على الـ VPS
 
 ```bash
-ssh root@YOUR_VPS_IP
 cd /root/codentra-vps-mongodb
 chmod +x deploy.sh setup.sh
 sudo ./deploy.sh

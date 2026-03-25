@@ -4,6 +4,13 @@ set -euo pipefail
 
 APP_DIR="/opt/codentra-mongodb"
 SOURCE_DIR="$(pwd)"
+if [ "$(id -u)" -eq 0 ]; then
+  SUDO=""
+  OWNER_USER="${SUDO_USER:-root}"
+else
+  SUDO="sudo"
+  OWNER_USER="${USER}"
+fi
 
 if docker compose version >/dev/null 2>&1; then
   COMPOSE_CMD="docker compose"
@@ -19,10 +26,10 @@ if [ ! -f "${SOURCE_DIR}/docker-compose.yml" ]; then
   exit 1
 fi
 
-sudo mkdir -p "${APP_DIR}"
+${SUDO} mkdir -p "${APP_DIR}"
 if [ "${SOURCE_DIR}" != "${APP_DIR}" ]; then
-  sudo cp -R "${SOURCE_DIR}"/. "${APP_DIR}/"
-  sudo chown -R "${USER}":"${USER}" "${APP_DIR}"
+  ${SUDO} cp -R "${SOURCE_DIR}"/. "${APP_DIR}/"
+  ${SUDO} chown -R "${OWNER_USER}":"${OWNER_USER}" "${APP_DIR}"
 fi
 
 cd "${APP_DIR}"

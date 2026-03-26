@@ -92,7 +92,7 @@ const normalizeValue = (key, value) => {
   return value;
 };
 
-const createMongoBackedDb = ({ dataDir }) => {
+const createMongoBackedDb = ({ dataDir, seedDir = dataDir }) => {
   ensureDirectory(dataDir);
 
   const state = {};
@@ -101,16 +101,17 @@ const createMongoBackedDb = ({ dataDir }) => {
 
   const readSeedData = (key) => {
     const config = DATASET_CONFIG[key];
-    const filePath = path.join(dataDir, config.file);
+    const writablePath = path.join(dataDir, config.file);
+    const seedPath = path.join(seedDir, config.file);
 
-    if (!fs.existsSync(filePath)) {
+    if (!fs.existsSync(seedPath)) {
       const initial = normalizeValue(key, config.defaultValue());
-      fs.writeFileSync(filePath, JSON.stringify(initial, null, 2));
+      fs.writeFileSync(writablePath, JSON.stringify(initial, null, 2));
       return initial;
     }
 
     try {
-      const raw = fs.readFileSync(filePath, 'utf8');
+      const raw = fs.readFileSync(seedPath, 'utf8');
       if (!raw.trim()) {
         return normalizeValue(key, config.defaultValue());
       }

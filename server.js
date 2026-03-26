@@ -18,6 +18,7 @@ const WatermarkProcessor = require('./utils/watermark');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const IS_VERCEL = Boolean(process.env.VERCEL || process.env.NOW_REGION);
 const MONGO_HOST = process.env.MONGO_HOST || '127.0.0.1';
 const MONGO_PORT = process.env.MONGO_PORT || '27017';
 const MONGO_DATABASE = process.env.MONGO_DATABASE || 'codentra';
@@ -71,10 +72,23 @@ const normalizeStoredPath = (storedPath) => {
   return storedPath.startsWith('/') ? storedPath.slice(1) : storedPath;
 };
 
+const BUNDLED_DATA_DIR = path.join(__dirname, 'data');
+const BUNDLED_UPLOADS_DIR = path.join(__dirname, 'uploads');
+const RUNTIME_ROOT_DIR = IS_VERCEL ? path.join('/tmp', 'codentra-runtime') : __dirname;
+
 const toAbsolutePath = (storedPath) => {
   const normalized = normalizeStoredPath(storedPath);
   if (!normalized) return null;
-  return path.join(__dirname, normalized);
+
+  const candidates = [];
+  if (normalized.startsWith('uploads/')) {
+    const relativeUploadPath = normalized.slice('uploads/'.length);
+    candidates.push(path.join(BUNDLED_UPLOADS_DIR, relativeUploadPath));
+    candidates.push(path.join(UPLOADS_DIR, relativeUploadPath));
+  }
+
+  candidates.push(path.join(__dirname, normalized));
+  return candidates.find(candidate => fs.existsSync(candidate)) || candidates[0];
 };
 
 const formatMoney = (v) => {
@@ -151,8 +165,8 @@ const calculateRefundForRejectedItem = ({ rejectedPurchase, allPurchases }) => {
 };
 
 // Data storage paths
-const DATA_DIR = path.join(__dirname, 'data');
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
+const DATA_DIR = path.join(RUNTIME_ROOT_DIR, 'data');
+const UPLOADS_DIR = path.join(RUNTIME_ROOT_DIR, 'uploads');
 const MEETING_RECORDINGS_DIR = path.join(UPLOADS_DIR, 'meeting-recordings');
 const ADMIN_TEAM_UPLOADS_DIR = path.join(UPLOADS_DIR, 'admin-team');
 
@@ -161,8 +175,9 @@ const ADMIN_TEAM_UPLOADS_DIR = path.join(UPLOADS_DIR, 'admin-team');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
-const mongoState = createMongoBackedDb({ dataDir: DATA_DIR });
+const mongoState = createMongoBackedDb({ dataDir: DATA_DIR, seedDir: BUNDLED_DATA_DIR });
 const db = mongoState.db;
+let bootstrapPromise = null;
 
 const normalizeCouponCode = (code) => {
   if (!code || typeof code !== 'string') return '';
@@ -452,11 +467,29 @@ const ensureDefaultAdmin = async () => {
   }
 };
 
+const ensureAppReady = async () => {
+  if (mongoState.isReady()) return;
+  if (!bootstrapPromise) {
+    bootstrapPromise = (async () => {
+      await mongoState.init({ mongoUri: MONGO_URI });
+      await ensureDefaultAdmin();
+    })().catch((error) => {
+      bootstrapPromise = null;
+      throw error;
+    });
+  }
+
+  await bootstrapPromise;
+};
+
 // Middleware
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 app.use('/uploads', express.static(UPLOADS_DIR));
+if (IS_VERCEL) {
+  app.use('/uploads', express.static(BUNDLED_UPLOADS_DIR));
+}
 
 if (TRUST_PROXY) {
   app.set('trust proxy', 1);
@@ -481,10 +514,28 @@ app.use(session({
   }
 }));
 
-app.get('/health', (req, res) => {
-  res.status(mongoState.isReady() ? 200 : 503).json({
-    status: mongoState.isReady() ? 'ok' : 'starting'
-  });
+app.use(async (req, res, next) => {
+  try {
+    await ensureAppReady();
+    next();
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/health', async (req, res) => {
+  try {
+    await ensureAppReady();
+    res.status(200).json({
+      status: 'ok',
+      runtime: IS_VERCEL ? 'vercel' : 'server'
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      message: error.message
+    });
+  }
 });
 
 const isBlockedExpired = (u) => {
@@ -3516,55 +3567,59 @@ app.post('/admin/messages/:userId', requireAdmin, (req, res) => {
 });
 
 const httpServer = http.createServer(app);
-const io = new Server(httpServer, {
-  cors: {
-    origin: allowAnyCorsOrigin ? true : configuredCorsOrigins,
-    methods: ["GET", "POST"],
-    credentials: true
-  }
-});
+let io = null;
 
-io.on('connection', (socket) => {
-  socket.on('join-room', (roomId) => {
-    if (!roomId) return;
-    socket.join(roomId);
-    socket.to(roomId).emit('peer-joined');
-  });
-
-  socket.on('webrtc-offer', ({ roomId, offer }) => {
-    if (!roomId || !offer) return;
-    socket.to(roomId).emit('webrtc-offer', { offer });
-  });
-
-  socket.on('webrtc-answer', ({ roomId, answer }) => {
-    if (!roomId || !answer) return;
-    socket.to(roomId).emit('webrtc-answer', { answer });
-  });
-
-  socket.on('webrtc-ice-candidate', ({ roomId, candidate }) => {
-    if (!roomId || !candidate) return;
-    socket.to(roomId).emit('webrtc-ice-candidate', { candidate });
-  });
-
-  socket.on('leave-room', (roomId) => {
-    if (!roomId) return;
-    socket.leave(roomId);
-    socket.to(roomId).emit('peer-left');
-  });
-
-  socket.on('join-admin-team', () => {
-    socket.join('admin-team');
-  });
-
-  socket.on('admin-team-message', (payload) => {
-    try {
-      if (!payload || typeof payload !== 'object') return;
-      socket.to('admin-team').emit('admin-team-message', payload);
-    } catch (e) {
-      // ignore
+if (!IS_VERCEL) {
+  io = new Server(httpServer, {
+    cors: {
+      origin: allowAnyCorsOrigin ? true : configuredCorsOrigins,
+      methods: ["GET", "POST"],
+      credentials: true
     }
   });
-});
+
+  io.on('connection', (socket) => {
+    socket.on('join-room', (roomId) => {
+      if (!roomId) return;
+      socket.join(roomId);
+      socket.to(roomId).emit('peer-joined');
+    });
+
+    socket.on('webrtc-offer', ({ roomId, offer }) => {
+      if (!roomId || !offer) return;
+      socket.to(roomId).emit('webrtc-offer', { offer });
+    });
+
+    socket.on('webrtc-answer', ({ roomId, answer }) => {
+      if (!roomId || !answer) return;
+      socket.to(roomId).emit('webrtc-answer', { answer });
+    });
+
+    socket.on('webrtc-ice-candidate', ({ roomId, candidate }) => {
+      if (!roomId || !candidate) return;
+      socket.to(roomId).emit('webrtc-ice-candidate', { candidate });
+    });
+
+    socket.on('leave-room', (roomId) => {
+      if (!roomId) return;
+      socket.leave(roomId);
+      socket.to(roomId).emit('peer-left');
+    });
+
+    socket.on('join-admin-team', () => {
+      socket.join('admin-team');
+    });
+
+    socket.on('admin-team-message', (payload) => {
+      try {
+        if (!payload || typeof payload !== 'object') return;
+        socket.to('admin-team').emit('admin-team-message', payload);
+      } catch (e) {
+        // ignore
+      }
+    });
+  });
+}
 
 let shuttingDown = false;
 
@@ -3601,16 +3656,17 @@ const shutdown = async (signal) => {
   process.exit(0);
 };
 
-['SIGINT', 'SIGTERM'].forEach((signal) => {
-  process.on(signal, () => {
-    void shutdown(signal);
+if (!IS_VERCEL) {
+  ['SIGINT', 'SIGTERM'].forEach((signal) => {
+    process.on(signal, () => {
+      void shutdown(signal);
+    });
   });
-});
+}
 
 const startServer = async () => {
   try {
-    await mongoState.init({ mongoUri: MONGO_URI });
-    await ensureDefaultAdmin();
+    await ensureAppReady();
 
     httpServer.listen(PORT, '0.0.0.0', () => {
       console.log(`Codentra running on http://0.0.0.0:${PORT}`);
@@ -3623,4 +3679,9 @@ const startServer = async () => {
   }
 };
 
-void startServer();
+if (!IS_VERCEL) {
+  void startServer();
+}
+
+module.exports = app;
+module.exports.default = app;

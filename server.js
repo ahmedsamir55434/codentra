@@ -2,58 +2,27 @@ require('dotenv').config();
 
 const express = require('express');
 const session = require('express-session');
-const MongoStore = require('connect-mongo');
 const multer = require('multer');
 const bcrypt = require('bcryptjs');
+const nodemailer = require('nodemailer');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const crypto = require('crypto');
+const os = require('os');
 const { v4: uuidv4 } = require('uuid');
 const { Server } = require('socket.io');
 const PDFDocument = require('pdfkit');
 const jwt = require('jsonwebtoken');
-const { createMongoBackedDb } = require('./db/mongo-state');
+const PptxGenJS = require('pptxgenjs');
 const WatermarkProcessor = require('./utils/watermark');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const IS_VERCEL = Boolean(process.env.VERCEL || process.env.NOW_REGION);
-const MONGO_HOST = process.env.MONGO_HOST || '127.0.0.1';
-const MONGO_PORT = process.env.MONGO_PORT || '27017';
-const MONGO_DATABASE = process.env.MONGO_DATABASE || 'codentra';
-const MONGO_USERNAME = process.env.MONGO_ROOT_USERNAME || process.env.MONGO_USERNAME || '';
-const MONGO_PASSWORD = process.env.MONGO_ROOT_PASSWORD || process.env.MONGO_PASSWORD || '';
-const defaultMongoUri = MONGO_USERNAME && MONGO_PASSWORD
-  ? `mongodb://${encodeURIComponent(MONGO_USERNAME)}:${encodeURIComponent(MONGO_PASSWORD)}@${MONGO_HOST}:${MONGO_PORT}/${MONGO_DATABASE}?authSource=admin`
-  : `mongodb://${MONGO_HOST}:${MONGO_PORT}/${MONGO_DATABASE}`;
-const MONGO_URI = process.env.MONGO_URI || defaultMongoUri;
-const SESSION_SECRET = process.env.SESSION_SECRET || 'codentra-session-secret-2024';
-const JWT_SECRET = process.env.JWT_SECRET || 'codentra-jwt-secret-2024';
-const JWT_EXPIRES_IN = '7d';
-const TRUST_PROXY = ['1', 'true', 'yes'].includes(String(process.env.TRUST_PROXY || '').toLowerCase());
-const COOKIE_SECURE = ['1', 'true', 'yes'].includes(String(process.env.COOKIE_SECURE || '').toLowerCase());
-const COOKIE_DOMAIN = process.env.COOKIE_DOMAIN || undefined;
-const configuredCorsOrigins = (process.env.CORS_ORIGIN || '*')
-  .split(',')
-  .map((value) => value.trim())
-  .filter(Boolean);
-const allowAnyCorsOrigin = configuredCorsOrigins.includes('*');
 
 // CORS middleware
 app.use((req, res, next) => {
-  if (allowAnyCorsOrigin) {
-    res.header('Access-Control-Allow-Origin', '*');
-  } else {
-    const requestOrigin = req.headers.origin;
-    const responseOrigin = requestOrigin && configuredCorsOrigins.includes(requestOrigin)
-      ? requestOrigin
-      : configuredCorsOrigins[0];
-    if (responseOrigin) {
-      res.header('Access-Control-Allow-Origin', responseOrigin);
-      res.header('Vary', 'Origin');
-    }
-  }
+  res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
   if (req.method === 'OPTIONS') {
@@ -72,23 +41,10 @@ const normalizeStoredPath = (storedPath) => {
   return storedPath.startsWith('/') ? storedPath.slice(1) : storedPath;
 };
 
-const BUNDLED_DATA_DIR = path.join(__dirname, 'data');
-const BUNDLED_UPLOADS_DIR = path.join(__dirname, 'uploads');
-const RUNTIME_ROOT_DIR = IS_VERCEL ? path.join('/tmp', 'codentra-runtime') : __dirname;
-
 const toAbsolutePath = (storedPath) => {
   const normalized = normalizeStoredPath(storedPath);
   if (!normalized) return null;
-
-  const candidates = [];
-  if (normalized.startsWith('uploads/')) {
-    const relativeUploadPath = normalized.slice('uploads/'.length);
-    candidates.push(path.join(BUNDLED_UPLOADS_DIR, relativeUploadPath));
-    candidates.push(path.join(UPLOADS_DIR, relativeUploadPath));
-  }
-
-  candidates.push(path.join(__dirname, normalized));
-  return candidates.find(candidate => fs.existsSync(candidate)) || candidates[0];
+  return path.join(__dirname, normalized);
 };
 
 const formatMoney = (v) => {
@@ -105,6 +61,266 @@ const buildInvoiceNumber = () => {
   const stamp = `${yyyy}${mm}${dd}`;
   return `INV-${stamp}-${String(Date.now()).slice(-6)}`;
 };
+
+const INVOICE_FONT_PATH = path.join(__dirname, 'assets', 'fonts', 'NotoNaskhArabic-Regular.ttf');
+
+const formatInvoiceDate = (value) => {
+  if (!value) return '-';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '-';
+  return date.toLocaleString('en-GB');
+};
+
+const applyInvoiceFont = (doc) => {
+  if (fs.existsSync(INVOICE_FONT_PATH)) {
+    doc.font(INVOICE_FONT_PATH);
+  }
+  return doc;
+};
+
+const writeInvoiceField = (doc, arabicLabel, englishLabel, value, options = {}) => {
+  const textValue = value == null || value === '' ? '-' : String(value);
+  const fontSize = options.fontSize || 11;
+  const gap = options.gap == null ? 0.2 : options.gap;
+
+  doc.fontSize(fontSize).text(`${arabicLabel}: ${textValue}`, { align: 'right' });
+  doc.text(`${englishLabel}: ${textValue}`, { align: 'left' });
+  doc.moveDown(gap);
+};
+
+const getInvoiceItems = (inv) => {
+  if (Array.isArray(inv && inv.items) && inv.items.length) {
+    return inv.items;
+  }
+
+  return db
+    .purchases()
+    .filter(p => p && (p.orderId === inv.orderId || p.id === inv.orderId))
+    .map(p => ({
+      projectTitle: p.projectTitle || p.projectId || 'Project',
+      projectId: p.projectId || null,
+      priceBefore: p.priceBefore != null ? p.priceBefore : p.price,
+      discountAmount: p.discountAmount != null ? p.discountAmount : 0,
+      priceAfter: p.priceAfter != null ? p.priceAfter : p.price
+    }));
+};
+
+const renderInvoicePdf = ({ res, inv, includeEmail = false, includeCoupon = false }) => {
+  const doc = new PDFDocument({ size: 'A4', margin: 50 });
+  applyInvoiceFont(doc);
+  doc.pipe(res);
+
+  doc.fontSize(20).text('Codentra', { align: 'center' });
+  doc.fontSize(16).text('فاتورة / Invoice', { align: 'center' });
+  doc.moveDown(1);
+
+  writeInvoiceField(doc, 'رقم الفاتورة', 'Invoice No', inv.invoiceNumber || '-');
+  writeInvoiceField(doc, 'التاريخ', 'Date', formatInvoiceDate(inv.createdAt));
+  writeInvoiceField(doc, 'اسم العميل', 'Customer', inv.userName || '-');
+
+  if (includeEmail && inv.userEmail) {
+    writeInvoiceField(doc, 'البريد الإلكتروني', 'Email', inv.userEmail);
+  }
+
+  writeInvoiceField(doc, 'رقم الطلب', 'Order ID', inv.orderId || '-');
+
+  if (includeCoupon && inv.couponCode) {
+    writeInvoiceField(doc, 'كود الخصم', 'Coupon', inv.couponCode);
+  }
+
+  doc.moveDown(0.5);
+  doc.fontSize(14).text('العناصر / Items', { underline: true, align: 'center' });
+  doc.moveDown(0.5);
+
+  const items = getInvoiceItems(inv);
+  if (!items.length) {
+    doc.fontSize(11).text('لا توجد عناصر في هذه الفاتورة', { align: 'right' });
+    doc.text('No items available for this invoice', { align: 'left' });
+  } else {
+    items.forEach((item, index) => {
+      const title = item.projectTitle || item.projectId || 'Project';
+      doc.fontSize(11).text(`العنصر ${index + 1}: ${title}`, { align: 'right' });
+      doc.text(`Item ${index + 1}: ${title}`, { align: 'left' });
+      doc
+        .fontSize(10)
+        .text(
+          `قبل الخصم: ${formatMoney(item.priceBefore)} EGP | الخصم: ${formatMoney(item.discountAmount)} EGP | بعد الخصم: ${formatMoney(item.priceAfter)} EGP`,
+          { align: 'right' }
+        );
+      doc.text(
+        `Before: ${formatMoney(item.priceBefore)} EGP | Discount: ${formatMoney(item.discountAmount)} EGP | After: ${formatMoney(item.priceAfter)} EGP`,
+        { align: 'left' }
+      );
+      doc.moveDown(0.4);
+    });
+  }
+
+  doc.moveDown(0.8);
+  doc.fontSize(14).text('الملخص / Summary', { underline: true, align: 'center' });
+  doc.moveDown(0.5);
+  writeInvoiceField(doc, 'الإجمالي قبل الخصم', 'Total Before', `${formatMoney(inv.totalBefore)} EGP`);
+  writeInvoiceField(doc, 'إجمالي الخصم', 'Total Discount', `${formatMoney(inv.totalDiscount)} EGP`);
+  writeInvoiceField(doc, 'الإجمالي بعد الخصم', 'Total After', `${formatMoney(inv.totalAfter)} EGP`, {
+    fontSize: 13
+  });
+
+  doc.end();
+};
+
+const HIGH_VALUE_PAYMENT_THRESHOLD = 5000;
+const PAYMENT_VERIFICATION_TTL_MS = 10 * 60 * 1000;
+const PAYMENT_VERIFICATION_CODE_LENGTH = 6;
+const PRESENTATION_AI_MODEL = process.env.OPENAI_MODEL || 'gpt-5-mini';
+
+const DEFAULT_PRESENTATION_PLANS = [
+  {
+    id: 'presentations-monthly',
+    name: 'الاشتراك الشهري',
+    interval: 'monthly',
+    price: 499,
+    durationDays: 30,
+    generationCredits: 40,
+    badge: 'الأكثر طلبًا',
+    description: 'أنشئ حتى 40 بريزنتيشن شهريًا مع تحميل PowerPoint جاهز.'
+  },
+  {
+    id: 'presentations-yearly',
+    name: 'الاشتراك السنوي',
+    interval: 'yearly',
+    price: 4499,
+    durationDays: 365,
+    generationCredits: 600,
+    badge: 'أفضل قيمة',
+    description: 'حل سنوي للشركات والفرق مع 600 بريزنتيشن وتكلفة أقل لكل عرض.'
+  }
+];
+
+const normalizeWalletCardNumber = (value) => {
+  if (value == null) return '';
+  return String(value).replace(/\D+/g, '').slice(0, 16);
+};
+
+const formatWalletCardNumber = (value) => {
+  const digits = normalizeWalletCardNumber(value);
+  if (!digits) return '';
+  return digits.replace(/(.{4})/g, '$1 ').trim();
+};
+
+const maskWalletCardNumber = (value) => {
+  const digits = normalizeWalletCardNumber(value);
+  if (!digits) return null;
+  return `**** **** **** ${digits.slice(-4)}`;
+};
+
+const createWalletCardNumber = (users = []) => {
+  const used = new Set(
+    users
+      .map(u => normalizeWalletCardNumber(u && u.walletCardNumber))
+      .filter(Boolean)
+  );
+
+  let candidate = '';
+  do {
+    candidate = Array.from({ length: 16 }, () => Math.floor(Math.random() * 10)).join('');
+  } while (used.has(candidate));
+
+  return candidate;
+};
+
+const maskEmail = (email) => {
+  if (!email || typeof email !== 'string' || !email.includes('@')) return 'البريد المسجل';
+  const [local, domain] = email.split('@');
+  if (!local || !domain) return 'البريد المسجل';
+  const visibleLocal = local.length <= 2 ? `${local[0] || '*'}*` : `${local.slice(0, 2)}${'*'.repeat(Math.max(1, local.length - 2))}`;
+  const domainParts = domain.split('.');
+  const root = domainParts.shift() || '';
+  const tld = domainParts.join('.');
+  const visibleRoot = root.length <= 2 ? `${root[0] || '*'}*` : `${root.slice(0, 2)}${'*'.repeat(Math.max(1, root.length - 2))}`;
+  return `${visibleLocal}@${visibleRoot}${tld ? `.${tld}` : ''}`;
+};
+
+const generatePaymentVerificationCode = () => {
+  const min = 10 ** (PAYMENT_VERIFICATION_CODE_LENGTH - 1);
+  const max = (10 ** PAYMENT_VERIFICATION_CODE_LENGTH) - 1;
+  return String(Math.floor(min + (Math.random() * (max - min + 1))));
+};
+
+const hashPaymentVerificationCode = (code) => {
+  return crypto.createHash('sha256').update(String(code || '')).digest('hex');
+};
+
+const isPaymentAttemptExpired = (attempt) => {
+  if (!attempt || !attempt.expiresAt) return true;
+  const expiresAt = new Date(attempt.expiresAt);
+  if (Number.isNaN(expiresAt.getTime())) return true;
+  return expiresAt.getTime() <= Date.now();
+};
+
+const findUserByWalletCardNumber = ({ users, walletCardNumber }) => {
+  const normalized = normalizeWalletCardNumber(walletCardNumber);
+  if (!normalized) return null;
+  return users.find(u => u && u.role === 'user' && normalizeWalletCardNumber(u.walletCardNumber) === normalized) || null;
+};
+
+let cachedMailTransporter = null;
+
+const getMailTransporter = () => {
+  const host = process.env.SMTP_HOST;
+  const port = Number(process.env.SMTP_PORT || 0);
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  const from = process.env.SMTP_FROM;
+
+  if (!host || !port || !user || !pass || !from) {
+    throw new Error('SMTP is not configured');
+  }
+
+  if (!cachedMailTransporter) {
+    cachedMailTransporter = nodemailer.createTransport({
+      host,
+      port,
+      secure: port === 465,
+      auth: { user, pass }
+    });
+  }
+
+  return { transporter: cachedMailTransporter, from };
+};
+
+const sendPaymentVerificationCode = async ({ payerUser, buyerUser, code, amount, maskedCardNumber }) => {
+  const { transporter, from } = getMailTransporter();
+  await transporter.sendMail({
+    from,
+    to: payerUser.email,
+    subject: 'Codentra payment verification code',
+    text: [
+      `Hello ${payerUser.name || 'User'},`,
+      '',
+      `A payment request was created on Codentra using your wallet card ${maskedCardNumber || ''}.`,
+      `Buyer account: ${buyerUser && (buyerUser.name || buyerUser.email || buyerUser.id) ? (buyerUser.name || buyerUser.email || buyerUser.id) : 'Unknown user'}`,
+      `Amount: ${formatMoney(amount)} EGP`,
+      `Verification code: ${code}`,
+      '',
+      'The code expires in 10 minutes.',
+      'If this request was not expected, do not share this code.'
+    ].join('\n'),
+    html: `
+      <div style="font-family:Arial,sans-serif;direction:ltr">
+        <h2>Codentra payment verification</h2>
+        <p>Hello ${payerUser.name || 'User'},</p>
+        <p>A payment request was created using your wallet card <strong>${maskedCardNumber || ''}</strong>.</p>
+        <p><strong>Buyer:</strong> ${buyerUser && (buyerUser.name || buyerUser.email || buyerUser.id) ? (buyerUser.name || buyerUser.email || buyerUser.id) : 'Unknown user'}</p>
+        <p><strong>Amount:</strong> ${formatMoney(amount)} EGP</p>
+        <p><strong>Verification code:</strong> <span style="font-size:24px;letter-spacing:4px">${code}</span></p>
+        <p>This code expires in 10 minutes. If this request was not expected, do not share this code.</p>
+      </div>
+    `
+  });
+};
+
+// JWT Helpers
+const JWT_SECRET = 'codentra-jwt-secret-2024';
+const JWT_EXPIRES_IN = '7d';
 
 const generateToken = (user) => {
   const payload = {
@@ -165,8 +381,8 @@ const calculateRefundForRejectedItem = ({ rejectedPurchase, allPurchases }) => {
 };
 
 // Data storage paths
-const DATA_DIR = path.join(RUNTIME_ROOT_DIR, 'data');
-const UPLOADS_DIR = path.join(RUNTIME_ROOT_DIR, 'uploads');
+const DATA_DIR = path.join(__dirname, 'data');
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
 const MEETING_RECORDINGS_DIR = path.join(UPLOADS_DIR, 'meeting-recordings');
 const ADMIN_TEAM_UPLOADS_DIR = path.join(UPLOADS_DIR, 'admin-team');
 
@@ -175,9 +391,208 @@ const ADMIN_TEAM_UPLOADS_DIR = path.join(UPLOADS_DIR, 'admin-team');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 });
 
-const mongoState = createMongoBackedDb({ dataDir: DATA_DIR, seedDir: BUNDLED_DATA_DIR });
-const db = mongoState.db;
-let bootstrapPromise = null;
+// JSON storage helpers
+const db = {
+  users: () => JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'users.json'), 'utf8') || '[]'),
+  projects: () => JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'projects.json'), 'utf8') || '[]'),
+  purchases: () => JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'purchases.json'), 'utf8') || '[]'),
+  modifications: () => JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'modifications.json'), 'utf8') || '[]'),
+  coupons: () => JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'coupons.json'), 'utf8') || '[]'),
+  referrals: () => JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'referrals.json'), 'utf8') || '[]'),
+  walletCodes: () => JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'wallet-codes.json'), 'utf8') || '[]'),
+  walletPaymentAttempts: () => {
+    const filePath = path.join(DATA_DIR, 'wallet-payment-attempts.json');
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, JSON.stringify([], null, 2));
+      return [];
+    }
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8') || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  },
+  appointments: () => {
+    const filePath = path.join(DATA_DIR, 'appointments.json');
+    if (!fs.existsSync(filePath)) {
+      const initial = { timeSlots: [], bookings: [] };
+      fs.writeFileSync(filePath, JSON.stringify(initial, null, 2));
+      return initial;
+    }
+    return JSON.parse(fs.readFileSync(filePath, 'utf8') || '{"timeSlots":[],"bookings":[]}');
+  },
+  saveUsers: (data) => fs.writeFileSync(path.join(DATA_DIR, 'users.json'), JSON.stringify(data, null, 2)),
+  saveProjects: (data) => fs.writeFileSync(path.join(DATA_DIR, 'projects.json'), JSON.stringify(data, null, 2)),
+  savePurchases: (data) => fs.writeFileSync(path.join(DATA_DIR, 'purchases.json'), JSON.stringify(data, null, 2)),
+  saveModifications: (data) => fs.writeFileSync(path.join(DATA_DIR, 'modifications.json'), JSON.stringify(data, null, 2)),
+  saveCoupons: (data) => fs.writeFileSync(path.join(DATA_DIR, 'coupons.json'), JSON.stringify(data, null, 2)),
+  saveReferrals: (data) => fs.writeFileSync(path.join(DATA_DIR, 'referrals.json'), JSON.stringify(data, null, 2)),
+  saveWalletCodes: (data) => fs.writeFileSync(path.join(DATA_DIR, 'wallet-codes.json'), JSON.stringify(data, null, 2)),
+  saveWalletPaymentAttempts: (data) => fs.writeFileSync(path.join(DATA_DIR, 'wallet-payment-attempts.json'), JSON.stringify(data, null, 2)),
+  reviews: () => JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'reviews.json'), 'utf8') || '[]'),
+  saveReviews: (data) => fs.writeFileSync(path.join(DATA_DIR, 'reviews.json'), JSON.stringify(data, null, 2)),
+  messages: () => JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'messages.json'), 'utf8') || '[]'),
+  saveMessages: (data) => fs.writeFileSync(path.join(DATA_DIR, 'messages.json'), JSON.stringify(data, null, 2)),
+  adminTeamMessages: () => {
+    const filePath = path.join(DATA_DIR, 'admin-team-messages.json');
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, JSON.stringify([], null, 2));
+      return [];
+    }
+    return JSON.parse(fs.readFileSync(filePath, 'utf8') || '[]');
+  },
+  saveAdminTeamMessages: (data) => fs.writeFileSync(path.join(DATA_DIR, 'admin-team-messages.json'), JSON.stringify(data, null, 2)),
+  carts: () => {
+    const filePath = path.join(DATA_DIR, 'carts.json');
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, JSON.stringify([], null, 2));
+      return [];
+    }
+    return JSON.parse(fs.readFileSync(filePath, 'utf8') || '[]');
+  },
+  saveCarts: (data) => fs.writeFileSync(path.join(DATA_DIR, 'carts.json'), JSON.stringify(data, null, 2)),
+  invoices: () => {
+    const filePath = path.join(DATA_DIR, 'invoices.json');
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, JSON.stringify([], null, 2));
+      return [];
+    }
+    return JSON.parse(fs.readFileSync(filePath, 'utf8') || '[]');
+  },
+  saveInvoices: (data) => fs.writeFileSync(path.join(DATA_DIR, 'invoices.json'), JSON.stringify(data, null, 2)),
+  saveAppointments: (data) => fs.writeFileSync(path.join(DATA_DIR, 'appointments.json'), JSON.stringify(data, null, 2))
+  ,
+  meetingRecordings: () => {
+    const filePath = path.join(DATA_DIR, 'meeting-recordings.json');
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, JSON.stringify([], null, 2));
+      return [];
+    }
+    return JSON.parse(fs.readFileSync(filePath, 'utf8') || '[]');
+  },
+  saveMeetingRecordings: (data) => fs.writeFileSync(path.join(DATA_DIR, 'meeting-recordings.json'), JSON.stringify(data, null, 2)),
+  subscriptionPlans: () => {
+    const filePath = path.join(DATA_DIR, 'subscription-plans.json');
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, JSON.stringify([], null, 2));
+      return [];
+    }
+    return JSON.parse(fs.readFileSync(filePath, 'utf8') || '[]');
+  },
+  subscriptions: () => {
+    const filePath = path.join(DATA_DIR, 'subscriptions.json');
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, JSON.stringify([], null, 2));
+      return [];
+    }
+    return JSON.parse(fs.readFileSync(filePath, 'utf8') || '[]');
+  },
+  subscriptionPayments: () => {
+    const filePath = path.join(DATA_DIR, 'subscription-payments.json');
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, JSON.stringify([], null, 2));
+      return [];
+    }
+    return JSON.parse(fs.readFileSync(filePath, 'utf8') || '[]');
+  },
+  saveSubscriptionPlans: (data) => fs.writeFileSync(path.join(DATA_DIR, 'subscription-plans.json'), JSON.stringify(data, null, 2)),
+  saveSubscriptions: (data) => fs.writeFileSync(path.join(DATA_DIR, 'subscriptions.json'), JSON.stringify(data, null, 2)),
+  saveSubscriptionPayments: (data) => fs.writeFileSync(path.join(DATA_DIR, 'subscription-payments.json'), JSON.stringify(data, null, 2)),
+  subscriptionCoupons: () => {
+    const filePath = path.join(DATA_DIR, 'subscription-coupons.json');
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, JSON.stringify([], null, 2));
+      return [];
+    }
+    return JSON.parse(fs.readFileSync(filePath, 'utf8') || '[]');
+  },
+  saveSubscriptionCoupons: (data) => fs.writeFileSync(path.join(DATA_DIR, 'subscription-coupons.json'), JSON.stringify(data, null, 2)),
+  presentationPlans: () => {
+    const filePath = path.join(DATA_DIR, 'presentation-plans.json');
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, JSON.stringify([], null, 2));
+      return [];
+    }
+    return JSON.parse(fs.readFileSync(filePath, 'utf8') || '[]');
+  },
+  presentationSubscriptions: () => {
+    const filePath = path.join(DATA_DIR, 'presentation-subscriptions.json');
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, JSON.stringify([], null, 2));
+      return [];
+    }
+    return JSON.parse(fs.readFileSync(filePath, 'utf8') || '[]');
+  },
+  presentationDecks: () => {
+    const filePath = path.join(DATA_DIR, 'presentation-decks.json');
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, JSON.stringify([], null, 2));
+      return [];
+    }
+    return JSON.parse(fs.readFileSync(filePath, 'utf8') || '[]');
+  },
+  presentationPaymentAttempts: () => {
+    const filePath = path.join(DATA_DIR, 'presentation-payment-attempts.json');
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, JSON.stringify([], null, 2));
+      return [];
+    }
+    return JSON.parse(fs.readFileSync(filePath, 'utf8') || '[]');
+  },
+  savePresentationPlans: (data) => fs.writeFileSync(path.join(DATA_DIR, 'presentation-plans.json'), JSON.stringify(data, null, 2)),
+  savePresentationSubscriptions: (data) => fs.writeFileSync(path.join(DATA_DIR, 'presentation-subscriptions.json'), JSON.stringify(data, null, 2)),
+  savePresentationDecks: (data) => fs.writeFileSync(path.join(DATA_DIR, 'presentation-decks.json'), JSON.stringify(data, null, 2)),
+  savePresentationPaymentAttempts: (data) => fs.writeFileSync(path.join(DATA_DIR, 'presentation-payment-attempts.json'), JSON.stringify(data, null, 2)),
+  loyaltySettings: () => {
+    const filePath = path.join(DATA_DIR, 'loyalty-settings.json');
+    const defaults = {
+      enabled: true,
+      pointsPerEGP: 0.1,
+      redeem: { enabled: true, pointsToEGP: 0.1, minPoints: 100 }
+    };
+
+    if (!fs.existsSync(filePath)) {
+      fs.writeFileSync(filePath, JSON.stringify(defaults, null, 2));
+      return defaults;
+    }
+
+    const raw = fs.readFileSync(filePath, 'utf8').trim();
+    let parsed = {};
+    try {
+      parsed = raw ? JSON.parse(raw) : {};
+    } catch (error) {
+      parsed = {};
+    }
+
+    let changed = false;
+    if (parsed.enabled === undefined) {
+      parsed.enabled = defaults.enabled;
+      changed = true;
+    }
+    if (!parsed.pointsPerEGP) {
+      parsed.pointsPerEGP = defaults.pointsPerEGP;
+      changed = true;
+    }
+
+    parsed.redeem = parsed.redeem || {};
+    if (parsed.redeem.enabled === undefined) {
+      parsed.redeem.enabled = defaults.redeem.enabled;
+      changed = true;
+    }
+    if (!parsed.redeem.pointsToEGP) {
+      parsed.redeem.pointsToEGP = defaults.redeem.pointsToEGP;
+      changed = true;
+    }
+    if (!parsed.redeem.minPoints) {
+      parsed.redeem.minPoints = defaults.redeem.minPoints;
+      changed = true;
+    }
+
+    if (changed) {
+      fs.writeFileSync(filePath, JSON.stringify(parsed, null, 2));
+    }
+
+    return parsed;
+  },
+  saveLoyaltySettings: (data) => fs.writeFileSync(path.join(DATA_DIR, 'loyalty-settings.json'), JSON.stringify(data, null, 2))
+};
 
 const normalizeCouponCode = (code) => {
   if (!code || typeof code !== 'string') return '';
@@ -435,6 +850,142 @@ const getWalletCodeEligibility = (walletCode) => {
   return { eligible: true, reason: null };
 };
 
+const ensureUserPaymentProfile = ({ user, users }) => {
+  if (!user || user.role !== 'user') return false;
+
+  let changed = false;
+
+  if (!user.referralCode) {
+    user.referralCode = ensureUniqueReferralCode(users);
+    changed = true;
+  }
+
+  if (user.walletBalance == null) {
+    user.walletBalance = 0;
+    changed = true;
+  }
+
+  if (user.referredBy === undefined) {
+    user.referredBy = null;
+    changed = true;
+  }
+
+  if (user.loyaltyPoints == null) {
+    user.loyaltyPoints = 0;
+    changed = true;
+  }
+
+  if (!normalizeWalletCardNumber(user.walletCardNumber)) {
+    user.walletCardNumber = createWalletCardNumber(users);
+    changed = true;
+  } else {
+    const normalizedCard = normalizeWalletCardNumber(user.walletCardNumber);
+    if (user.walletCardNumber !== normalizedCard) {
+      user.walletCardNumber = normalizedCard;
+      changed = true;
+    }
+  }
+
+  if (user.walletPaymentPasswordHash === undefined) {
+    user.walletPaymentPasswordHash = null;
+    changed = true;
+  }
+
+  return changed;
+};
+
+const buildSessionUser = (user) => {
+  if (!user) return null;
+
+  const activeSubscription = user.role === 'user'
+    ? getActiveSubscriptionForUser({ userId: user.id })
+    : null;
+
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    isSuperAdmin: Boolean(user.isSuperAdmin),
+    adminPermissions: user.role === 'admin' ? (user.adminPermissions || null) : null,
+    referralCode: user.role === 'user' ? (user.referralCode || null) : null,
+    walletBalance: Number(user.walletBalance || 0),
+    walletCardNumberMasked: user.role === 'user' ? maskWalletCardNumber(user.walletCardNumber) : null,
+    hasWalletPaymentPassword: user.role === 'user' ? Boolean(user.walletPaymentPasswordHash) : false,
+    loyaltyPoints: user.role === 'user' ? normalizeLoyaltyPoints(user.loyaltyPoints) : 0,
+    subscription: activeSubscription ? {
+      planId: activeSubscription.planId,
+      status: activeSubscription.status,
+      currentPeriodEnd: activeSubscription.currentPeriodEnd
+    } : null
+  };
+};
+
+const getWalletPaymentAttemptsState = () => {
+  const attempts = db.walletPaymentAttempts();
+  return Array.isArray(attempts) ? attempts : [];
+};
+
+const saveWalletPaymentAttemptsState = (attempts) => {
+  db.saveWalletPaymentAttempts(Array.isArray(attempts) ? attempts : []);
+};
+
+const purgeExpiredWalletPaymentAttempts = () => {
+  const attempts = getWalletPaymentAttemptsState();
+  const nextAttempts = attempts.filter(attempt => !isPaymentAttemptExpired(attempt) && !attempt.usedAt);
+  if (nextAttempts.length !== attempts.length) {
+    saveWalletPaymentAttemptsState(nextAttempts);
+  }
+};
+
+const createWalletPaymentAttempt = async ({ buyerUser, payerUser, amount, kind, payload }) => {
+  purgeExpiredWalletPaymentAttempts();
+
+  const code = generatePaymentVerificationCode();
+  const attempt = {
+    id: uuidv4(),
+    buyerUserId: buyerUser.id,
+    payerUserId: payerUser.id,
+    payerCardLast4: normalizeWalletCardNumber(payerUser.walletCardNumber).slice(-4),
+    amount: Math.round(Number(amount || 0) * 100) / 100,
+    kind,
+    payload: payload || {},
+    codeHash: hashPaymentVerificationCode(code),
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + PAYMENT_VERIFICATION_TTL_MS).toISOString(),
+    usedAt: null
+  };
+
+  await sendPaymentVerificationCode({
+    payerUser,
+    buyerUser,
+    code,
+    amount: attempt.amount,
+    maskedCardNumber: maskWalletCardNumber(payerUser.walletCardNumber)
+  });
+
+  const attempts = getWalletPaymentAttemptsState();
+  attempts.push(attempt);
+  saveWalletPaymentAttemptsState(attempts);
+
+  return attempt;
+};
+
+const getWalletPaymentAttemptById = (attemptId) => {
+  if (!attemptId) return null;
+  const attempts = getWalletPaymentAttemptsState();
+  return attempts.find(attempt => attempt && attempt.id === attemptId) || null;
+};
+
+const markWalletPaymentAttemptUsed = (attemptId) => {
+  const attempts = getWalletPaymentAttemptsState();
+  const index = attempts.findIndex(attempt => attempt && attempt.id === attemptId);
+  if (index === -1) return false;
+  attempts[index].usedAt = new Date().toISOString();
+  saveWalletPaymentAttemptsState(attempts);
+  return true;
+};
+
 const getDownloadFileName = ({ originalFileName, projectTitle, filePath }) => {
   if (originalFileName && typeof originalFileName === 'string') return originalFileName;
   if (filePath && typeof filePath === 'string') {
@@ -450,93 +1001,436 @@ const getDownloadFileName = ({ originalFileName, projectTitle, filePath }) => {
   return `${projectTitle || 'project'}.zip`;
 };
 
-const ensureDefaultAdmin = async () => {
-  const users = db.users();
-  if (!users.find(u => u.email === 'admin@codentra.com')) {
-    users.push({
-      id: uuidv4(),
-      name: 'Admin',
-      email: 'admin@codentra.com',
-      password: bcrypt.hashSync('admin123', 10),
-      role: 'admin',
-      isSuperAdmin: true,
-      createdAt: new Date().toISOString()
-    });
-    db.saveUsers(users);
-    await mongoState.waitForWrites();
+const cloneDeep = (value) => JSON.parse(JSON.stringify(value));
+
+const ensurePresentationPlans = () => {
+  const current = db.presentationPlans();
+  if (Array.isArray(current) && current.length) return current;
+  const seeded = cloneDeep(DEFAULT_PRESENTATION_PLANS);
+  db.savePresentationPlans(seeded);
+  return seeded;
+};
+
+const getActivePresentationSubscriptionForUser = ({ userId }) => {
+  if (!userId) return null;
+  const subscriptions = db.presentationSubscriptions();
+  const now = Date.now();
+  return subscriptions
+    .filter((subscription) => {
+      if (!subscription || subscription.userId !== userId || subscription.status !== 'active') return false;
+      const end = new Date(subscription.currentPeriodEnd || 0).getTime();
+      return end > now;
+    })
+    .sort((a, b) => new Date(b.currentPeriodEnd || 0).getTime() - new Date(a.currentPeriodEnd || 0).getTime())[0] || null;
+};
+
+const getPresentationPlanById = ({ planId }) => {
+  const plans = ensurePresentationPlans();
+  return plans.find((plan) => plan && plan.id === planId) || null;
+};
+
+const getPresentationIncomingApprovals = ({ ownerUserId }) => {
+  const attempts = db.presentationPaymentAttempts();
+  return attempts
+    .filter((attempt) => attempt && attempt.payerUserId === ownerUserId && !attempt.usedAt && !isPaymentAttemptExpired(attempt))
+    .sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+};
+
+const getPresentationDecksForUser = ({ userId, limit = 8 }) => {
+  const decks = db.presentationDecks();
+  return decks
+    .filter((deck) => deck && deck.userId === userId)
+    .sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime())
+    .slice(0, limit);
+};
+
+const purgeExpiredPresentationPaymentAttempts = () => {
+  const attempts = db.presentationPaymentAttempts();
+  const nextAttempts = attempts.filter((attempt) => attempt && !attempt.usedAt && !isPaymentAttemptExpired(attempt));
+  if (nextAttempts.length !== attempts.length) {
+    db.savePresentationPaymentAttempts(nextAttempts);
   }
 };
 
-const ensureAppReady = async () => {
-  if (mongoState.isReady()) return;
-  if (!bootstrapPromise) {
-    bootstrapPromise = (async () => {
-      await mongoState.init({ mongoUri: MONGO_URI });
-      await ensureDefaultAdmin();
-    })().catch((error) => {
-      bootstrapPromise = null;
-      throw error;
-    });
+const getPresentationPaymentAttemptById = ({ attemptId }) => {
+  if (!attemptId) return null;
+  purgeExpiredPresentationPaymentAttempts();
+  const attempts = db.presentationPaymentAttempts();
+  return attempts.find((attempt) => attempt && attempt.id === attemptId) || null;
+};
+
+const markPresentationPaymentAttemptUsed = ({ attemptId }) => {
+  const attempts = db.presentationPaymentAttempts();
+  const index = attempts.findIndex((attempt) => attempt && attempt.id === attemptId);
+  if (index === -1) return false;
+  attempts[index].usedAt = new Date().toISOString();
+  db.savePresentationPaymentAttempts(attempts);
+  return true;
+};
+
+const createPresentationPaymentAttempt = ({ buyerUser, payerUser, plan }) => {
+  purgeExpiredPresentationPaymentAttempts();
+
+  const amount = Number(plan.price || 0);
+  if (Number(payerUser.walletBalance || 0) < amount) {
+    throw new Error('رصيد البطاقة غير كافٍ');
   }
 
-  await bootstrapPromise;
+  if (amount > HIGH_VALUE_PAYMENT_THRESHOLD && !payerUser.walletPaymentPasswordHash) {
+    throw new Error('صاحب البطاقة لم يضبط كلمة مرور البطاقة بعد');
+  }
+
+  const code = generatePaymentVerificationCode();
+  const attempts = db.presentationPaymentAttempts();
+  const attempt = {
+    id: uuidv4(),
+    buyerUserId: buyerUser.id,
+    payerUserId: payerUser.id,
+    planId: plan.id,
+    amount,
+    requiresPassword: amount > HIGH_VALUE_PAYMENT_THRESHOLD,
+    ownerVisibleCode: code,
+    codeHash: hashPaymentVerificationCode(code),
+    payerCardLast4: normalizeWalletCardNumber(payerUser.walletCardNumber).slice(-4),
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + PAYMENT_VERIFICATION_TTL_MS).toISOString(),
+    usedAt: null
+  };
+  attempts.push(attempt);
+  db.savePresentationPaymentAttempts(attempts);
+  return attempt;
 };
+
+const upsertPresentationSubscription = ({ userId, plan, payerUserId }) => {
+  const subscriptions = db.presentationSubscriptions();
+  const now = new Date();
+  const activeIndex = subscriptions.findIndex((subscription) => {
+    if (!subscription || subscription.userId !== userId || subscription.status !== 'active') return false;
+    const end = new Date(subscription.currentPeriodEnd || 0);
+    return !Number.isNaN(end.getTime()) && end > now;
+  });
+
+  if (activeIndex !== -1) {
+    const current = subscriptions[activeIndex];
+    const currentEnd = new Date(current.currentPeriodEnd || 0);
+    const baseTime = Math.max(now.getTime(), currentEnd.getTime());
+    subscriptions[activeIndex] = {
+      ...current,
+      planId: plan.id,
+      interval: plan.interval,
+      currentPeriodEnd: new Date(baseTime + (Number(plan.durationDays || 0) * 24 * 60 * 60 * 1000)).toISOString(),
+      remainingCredits: Number(current.remainingCredits || 0) + Number(plan.generationCredits || 0),
+      lastAmountPaid: Number(plan.price || 0),
+      lastPayerUserId: payerUserId,
+      updatedAt: new Date().toISOString()
+    };
+    db.savePresentationSubscriptions(subscriptions);
+    return subscriptions[activeIndex];
+  }
+
+  const subscription = {
+    id: uuidv4(),
+    userId,
+    planId: plan.id,
+    interval: plan.interval,
+    status: 'active',
+    currentPeriodStart: now.toISOString(),
+    currentPeriodEnd: new Date(now.getTime() + (Number(plan.durationDays || 0) * 24 * 60 * 60 * 1000)).toISOString(),
+    remainingCredits: Number(plan.generationCredits || 0),
+    createdAt: now.toISOString(),
+    updatedAt: now.toISOString(),
+    lastAmountPaid: Number(plan.price || 0),
+    lastPayerUserId: payerUserId
+  };
+  subscriptions.push(subscription);
+  db.savePresentationSubscriptions(subscriptions);
+  return subscription;
+};
+
+const consumePresentationCredit = ({ subscriptionId }) => {
+  const subscriptions = db.presentationSubscriptions();
+  const index = subscriptions.findIndex((subscription) => subscription && subscription.id === subscriptionId);
+  if (index === -1) throw new Error('الاشتراك غير موجود');
+  if (Number(subscriptions[index].remainingCredits || 0) <= 0) {
+    throw new Error('لا توجد عمليات إنشاء متبقية');
+  }
+
+  subscriptions[index].remainingCredits = Number(subscriptions[index].remainingCredits || 0) - 1;
+  subscriptions[index].updatedAt = new Date().toISOString();
+  db.savePresentationSubscriptions(subscriptions);
+  return subscriptions[index];
+};
+
+const countPresentationSlides = (value) => {
+  const amount = Number(value);
+  if (!Number.isFinite(amount)) return 7;
+  return Math.min(12, Math.max(4, Math.round(amount)));
+};
+
+const buildFallbackPresentation = ({ topic, audience, tone, purpose, slideCount, language }) => {
+  const isArabic = language !== 'en';
+  const titles = isArabic
+    ? ['مقدمة', 'التحدي', 'الرؤية', 'الحل', 'خطة التنفيذ', 'القيمة', 'الخطوات التالية', 'الخاتمة']
+    : ['Introduction', 'Problem', 'Vision', 'Solution', 'Execution Plan', 'Value', 'Next Steps', 'Closing'];
+
+  const slides = Array.from({ length: slideCount }, (_, index) => {
+    const title = titles[index] || (isArabic ? `شريحة ${index + 1}` : `Slide ${index + 1}`);
+    return {
+      title,
+      bullets: isArabic
+        ? [
+            `الموضوع الرئيسي: ${topic}`,
+            `الجمهور المستهدف: ${audience || 'عملاء أو إدارة'}`,
+            `النبرة المطلوبة: ${tone || 'احترافية'}`,
+            `هدف هذه الشريحة: ${purpose || 'شرح الفكرة'}`
+          ]
+        : [
+            `Main topic: ${topic}`,
+            `Audience: ${audience || 'clients or decision makers'}`,
+            `Tone: ${tone || 'professional'}`,
+            `Goal: ${purpose || 'explain the idea'}`
+          ],
+      speakerNotes: isArabic
+        ? `اربط هذه الشريحة بالهدف العام للعرض: ${purpose || topic}.`
+        : `Connect this slide to the main objective: ${purpose || topic}.`
+    };
+  });
+
+  return {
+    title: isArabic ? `عرض تقديمي: ${topic}` : `${topic} Presentation`,
+    subtitle: isArabic ? 'تم إنشاؤه بواسطة Codentra Presentations' : 'Generated by Codentra Presentations',
+    theme: tone || (isArabic ? 'احترافي' : 'Professional'),
+    slides
+  };
+};
+
+const normalizeGeneratedPresentation = (deck, options) => {
+  const fallback = buildFallbackPresentation(options);
+  if (!deck || typeof deck !== 'object') return fallback;
+
+  const rawSlides = Array.isArray(deck.slides) ? deck.slides : fallback.slides;
+  return {
+    title: String(deck.title || fallback.title),
+    subtitle: String(deck.subtitle || fallback.subtitle),
+    theme: String(deck.theme || fallback.theme),
+    slides: rawSlides.slice(0, options.slideCount).map((slide, index) => ({
+      title: String((slide && slide.title) || fallback.slides[index]?.title || `Slide ${index + 1}`),
+      bullets: Array.isArray(slide && slide.bullets) && slide.bullets.length
+        ? slide.bullets.slice(0, 5).map((bullet) => String(bullet))
+        : (fallback.slides[index]?.bullets || []),
+      speakerNotes: String((slide && slide.speakerNotes) || fallback.slides[index]?.speakerNotes || '')
+    }))
+  };
+};
+
+const generatePresentationWithOpenAI = async (options) => {
+  if (!process.env.OPENAI_API_KEY) {
+    return buildFallbackPresentation(options);
+  }
+
+  const schema = {
+    name: 'presentation_deck',
+    strict: true,
+    schema: {
+      type: 'object',
+      properties: {
+        title: { type: 'string' },
+        subtitle: { type: 'string' },
+        theme: { type: 'string' },
+        slides: {
+          type: 'array',
+          minItems: options.slideCount,
+          maxItems: options.slideCount,
+          items: {
+            type: 'object',
+            properties: {
+              title: { type: 'string' },
+              bullets: {
+                type: 'array',
+                minItems: 3,
+                maxItems: 5,
+                items: { type: 'string' }
+              },
+              speakerNotes: { type: 'string' }
+            },
+            required: ['title', 'bullets', 'speakerNotes'],
+            additionalProperties: false
+          }
+        }
+      },
+      required: ['title', 'subtitle', 'theme', 'slides'],
+      additionalProperties: false
+    }
+  };
+
+  const systemPrompt = options.language === 'en'
+    ? 'You are a presentation strategist for Codentra. Return only valid JSON matching the provided schema.'
+    : 'أنت خبير عروض تقديمية لشركة Codentra. أعد فقط JSON صالحًا مطابقًا للمخطط المطلوب.';
+
+  const userPrompt = options.language === 'en'
+    ? `Create a presentation about: ${options.topic}. Audience: ${options.audience || 'general'}. Goal: ${options.purpose || 'present an idea'}. Tone: ${options.tone || 'professional'}. Required slide count: ${options.slideCount}.`
+    : `أنشئ عرضًا تقديميًا عن: ${options.topic}. الجمهور: ${options.audience || 'عام'}. الهدف: ${options.purpose || 'عرض فكرة'}. النبرة: ${options.tone || 'احترافية'}. عدد الشرائح المطلوب: ${options.slideCount}.`;
+
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`
+    },
+    body: JSON.stringify({
+      model: PRESENTATION_AI_MODEL,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt }
+      ],
+      response_format: {
+        type: 'json_schema',
+        json_schema: schema
+      }
+    })
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`OpenAI request failed: ${response.status} ${errorText}`);
+  }
+
+  const data = await response.json();
+  const content = data?.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error('OpenAI did not return content');
+  }
+
+  return normalizeGeneratedPresentation(JSON.parse(content), options);
+};
+
+const generatePresentationDeck = async (options) => {
+  try {
+    return await generatePresentationWithOpenAI(options);
+  } catch (error) {
+    console.error('Presentation AI fallback:', error.message);
+    return buildFallbackPresentation(options);
+  }
+};
+
+const sanitizePresentationFileName = (value) => {
+  return String(value || 'presentation')
+    .replace(/[^\w\s-]/g, '')
+    .trim()
+    .replace(/\s+/g, '-')
+    .slice(0, 80) || 'presentation';
+};
+
+const buildPresentationPptxFile = async (deck) => {
+  const pptx = new PptxGenJS();
+  pptx.layout = 'LAYOUT_WIDE';
+  pptx.author = 'Codentra';
+  pptx.company = 'Codentra';
+  pptx.subject = deck.title;
+  pptx.title = deck.title;
+  pptx.lang = deck.language === 'en' ? 'en-US' : 'ar-SA';
+
+  const cover = pptx.addSlide();
+  cover.background = { color: 'F6F2EA' };
+  cover.addText(deck.title, {
+    x: 0.6, y: 1.1, w: 12.0, h: 0.7,
+    fontFace: 'Arial', fontSize: 24, bold: true, color: '132238',
+    align: deck.language === 'en' ? 'left' : 'right',
+    rtlMode: deck.language !== 'en'
+  });
+  cover.addText(deck.subtitle || 'Generated by Codentra Presentations', {
+    x: 0.6, y: 2.0, w: 12.0, h: 0.6,
+    fontFace: 'Arial', fontSize: 13, color: '5B6472',
+    align: deck.language === 'en' ? 'left' : 'right',
+    rtlMode: deck.language !== 'en'
+  });
+
+  deck.slides.forEach((slideData, index) => {
+    const slide = pptx.addSlide();
+    slide.background = { color: 'FFFFFF' };
+    slide.addText(slideData.title, {
+      x: 0.6, y: 0.5, w: 12.0, h: 0.5,
+      fontFace: 'Arial', fontSize: 20, bold: true, color: '132238',
+      align: deck.language === 'en' ? 'left' : 'right',
+      rtlMode: deck.language !== 'en'
+    });
+    slide.addText(
+      slideData.bullets.map((bullet) => ({
+        text: bullet,
+        options: {
+          bullet: { indent: 18 },
+          breakLine: true
+        }
+      })),
+      {
+        x: 0.9, y: 1.35, w: 11.4, h: 4.7,
+        fontFace: 'Arial', fontSize: 16, color: '233044',
+        paraSpaceAfterPt: 12,
+        align: deck.language === 'en' ? 'left' : 'right',
+        rtlMode: deck.language !== 'en',
+        valign: 'top'
+      }
+    );
+    slide.addText(`Slide ${index + 1}`, {
+      x: 0.6, y: 6.75, w: 12.0, h: 0.3,
+      fontFace: 'Arial', fontSize: 10, color: '7B8794',
+      align: deck.language === 'en' ? 'left' : 'right'
+    });
+  });
+
+  const fileName = `${sanitizePresentationFileName(deck.title)}-${deck.id}.pptx`;
+  const filePath = path.join(os.tmpdir(), fileName);
+  await pptx.writeFile({ fileName: filePath });
+  return { fileName, filePath };
+};
+
+// Initialize empty JSON files if they don't exist
+['users.json', 'projects.json', 'purchases.json', 'modifications.json', 'messages.json', 'admin-team-messages.json', 'carts.json', 'invoices.json', 'reviews.json', 'coupons.json', 'referrals.json', 'wallet-codes.json', 'wallet-payment-attempts.json'].forEach(file => {
+  const filePath = path.join(DATA_DIR, file);
+  if (!fs.existsSync(filePath)) {
+    fs.writeFileSync(filePath, '[]');
+  }
+});
+
+// Create default admin user if none exists
+const users = db.users();
+if (!users.find(u => u.email === 'admin@codentra.com')) {
+  users.push({
+    id: uuidv4(),
+    name: 'Admin',
+    email: 'admin@codentra.com',
+    password: bcrypt.hashSync('admin123', 10),
+    role: 'admin',
+    isSuperAdmin: true,
+    createdAt: new Date().toISOString()
+  });
+  db.saveUsers(users);
+}
+
+let didUpdateUsersForPaymentProfile = false;
+users.forEach(user => {
+  if (ensureUserPaymentProfile({ user, users })) {
+    didUpdateUsersForPaymentProfile = true;
+  }
+});
+if (didUpdateUsersForPaymentProfile) {
+  db.saveUsers(users);
+}
 
 // Middleware
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public')));
-app.use('/uploads', express.static(UPLOADS_DIR));
-if (IS_VERCEL) {
-  app.use('/uploads', express.static(BUNDLED_UPLOADS_DIR));
-}
-
-if (TRUST_PROXY) {
-  app.set('trust proxy', 1);
-}
+app.use(express.static('public'));
+app.use('/uploads', express.static('uploads'));
 
 app.use(session({
-  secret: SESSION_SECRET,
+  secret: 'codentra-secret-key-2024',
   resave: false,
   saveUninitialized: false,
-  proxy: TRUST_PROXY,
-  store: MongoStore.create({
-    mongoUrl: MONGO_URI,
-    collectionName: 'sessions',
-    ttl: 14 * 24 * 60 * 60
-  }),
   cookie: { 
-    httpOnly: true,
-    sameSite: 'lax',
-    secure: COOKIE_SECURE,
-    domain: COOKIE_DOMAIN,
     maxAge: 1000 * 60 * 60 * 24 * 7 // 7 days
   }
 }));
-
-app.use(async (req, res, next) => {
-  try {
-    await ensureAppReady();
-    next();
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get('/health', async (req, res) => {
-  try {
-    await ensureAppReady();
-    res.status(200).json({
-      status: 'ok',
-      runtime: IS_VERCEL ? 'vercel' : 'server'
-    });
-  } catch (error) {
-    res.status(500).json({
-      status: 'error',
-      message: error.message
-    });
-  }
-});
 
 const isBlockedExpired = (u) => {
   if (!u) return false;
@@ -585,6 +1479,11 @@ app.use((req, res, next) => {
 
     const fullUser = users[idx];
 
+    if (ensureUserPaymentProfile({ user: fullUser, users })) {
+      users[idx] = fullUser;
+      db.saveUsers(users);
+    }
+
     if (isBlockedExpired(fullUser)) {
       unblockUserInPlace(fullUser);
       users[idx] = fullUser;
@@ -596,15 +1495,7 @@ app.use((req, res, next) => {
       return res.redirect('/blocked');
     }
 
-    req.session.user = {
-      ...req.session.user,
-      name: fullUser.name,
-      email: fullUser.email,
-      role: fullUser.role,
-      isSuperAdmin: fullUser.isSuperAdmin,
-      adminPermissions: fullUser.adminPermissions,
-      walletBalance: fullUser.walletBalance
-    };
+    req.session.user = buildSessionUser(fullUser);
   } catch (e) {
     // ignore
   }
@@ -828,41 +1719,28 @@ app.post('/login', (req, res) => {
     return res.render('login', { error: 'Invalid email or password', user: null });
   }
 
+  const currentIndex = users.findIndex(u => u && u.id === user.id);
+  let shouldSaveUsers = false;
+
+  if (ensureUserPaymentProfile({ user, users })) {
+    shouldSaveUsers = true;
+  }
+
   if (isBlockedExpired(user)) {
     unblockUserInPlace(user);
-    const idx = users.findIndex(u => u && u.id === user.id);
-    if (idx !== -1) users[idx] = user;
-    db.saveUsers(users);
+    shouldSaveUsers = true;
   }
 
   if (user.isBlocked) {
-    req.session.user = {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      role: user.role,
-      isSuperAdmin: user.isSuperAdmin,
-      adminPermissions: user.adminPermissions,
-      walletBalance: Number(user.walletBalance || 0)
-    };
+    if (shouldSaveUsers && currentIndex !== -1) {
+      users[currentIndex] = user;
+      db.saveUsers(users);
+    }
+    req.session.user = buildSessionUser(user);
     return res.redirect('/blocked');
   }
 
-  let shouldSaveUsers = false;
-  if (user.role === 'user') {
-    if (!user.referralCode) {
-      user.referralCode = ensureUniqueReferralCode(users);
-      shouldSaveUsers = true;
-    }
-    if (user.walletBalance == null) {
-      user.walletBalance = 0;
-      shouldSaveUsers = true;
-    }
-    if (user.referredBy === undefined) {
-      user.referredBy = null;
-      shouldSaveUsers = true;
-    }
-  } else if (user.role === 'admin') {
+  if (user.role === 'admin') {
     if (user.isSuperAdmin == null) {
       user.isSuperAdmin = false;
       shouldSaveUsers = true;
@@ -873,31 +1751,12 @@ app.post('/login', (req, res) => {
     }
   }
 
-  if (shouldSaveUsers) {
-    const idx = users.findIndex(u => u.id === user.id);
-    if (idx !== -1) users[idx] = user;
+  if (shouldSaveUsers && currentIndex !== -1) {
+    users[currentIndex] = user;
     db.saveUsers(users);
   }
 
-  const activeSubscription = user.role === 'user'
-    ? getActiveSubscriptionForUser({ userId: user.id })
-    : null;
-  
-  req.session.user = {
-    id: user.id,
-    name: user.name,
-    email: user.email,
-    role: user.role,
-    isSuperAdmin: Boolean(user.isSuperAdmin),
-    adminPermissions: user.role === 'admin' ? (user.adminPermissions || null) : null,
-    referralCode: user.referralCode || null,
-    walletBalance: Number(user.walletBalance || 0),
-    subscription: activeSubscription ? {
-      planId: activeSubscription.planId,
-      status: activeSubscription.status,
-      currentPeriodEnd: activeSubscription.currentPeriodEnd
-    } : null
-  };
+  req.session.user = buildSessionUser(user);
   res.redirect(user.role === 'admin' ? '/admin' : '/');
 });
 
@@ -907,9 +1766,13 @@ app.get('/register', (req, res) => {
 });
 
 app.post('/register', (req, res) => {
-  const { name, email, password } = req.body;
+  const { name, email, password, walletPassword } = req.body;
   const referralInput = normalizeReferralCode(req.body.referralCode);
   const users = db.users();
+
+  if (!walletPassword || String(walletPassword).trim().length < 4) {
+    return res.render('register', { error: 'كلمة مرور البطاقة يجب ألا تقل عن 4 أحرف أو أرقام', user: null, referralPrefill: referralInput });
+  }
   
   if (users.find(u => u.email === email)) {
     return res.render('register', { error: 'Email already registered', user: null, referralPrefill: referralInput });
@@ -928,6 +1791,8 @@ app.post('/register', (req, res) => {
     role: 'user',
     referralCode: ensureUniqueReferralCode(users),
     walletBalance: 0,
+    walletCardNumber: createWalletCardNumber(users),
+    walletPaymentPasswordHash: bcrypt.hashSync(String(walletPassword), 10),
     referredBy: referralCheck.referrerUserId
       ? {
           referrerUserId: referralCheck.referrerUserId,
@@ -936,6 +1801,7 @@ app.post('/register', (req, res) => {
           rewardedAt: null
         }
       : null,
+    loyaltyPoints: 0,
     createdAt: new Date().toISOString()
   };
 
@@ -957,15 +1823,8 @@ app.post('/register', (req, res) => {
   
   users.push(newUser);
   db.saveUsers(users);
-  
-  req.session.user = {
-    id: newUser.id,
-    name: newUser.name,
-    email: newUser.email,
-    role: newUser.role,
-    referralCode: newUser.referralCode,
-    walletBalance: newUser.walletBalance
-  };
+
+  req.session.user = buildSessionUser(newUser);
   res.redirect('/');
 });
 
@@ -1183,35 +2042,7 @@ app.get('/api/invoice/:orderId.pdf', (req, res) => {
 
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `inline; filename="${inv.invoiceNumber || 'invoice'}.pdf"`);
-
-  const doc = new PDFDocument({ size: 'A4', margin: 50 });
-  doc.pipe(res);
-
-  doc.fontSize(18).text('Codentra - Invoice', { align: 'center' });
-  doc.moveDown(0.5);
-  doc.fontSize(12).text(`Invoice: ${inv.invoiceNumber || '-'}`);
-  doc.text(`Date: ${inv.createdAt ? new Date(inv.createdAt).toLocaleString('en-GB') : '-'}`);
-  doc.moveDown(0.5);
-  doc.text(`Customer: ${inv.userName || '-'}`);
-  doc.moveDown(0.5);
-  doc.text(`Order ID: ${inv.orderId || '-'}`);
-  doc.moveDown(1);
-
-  doc.fontSize(14).text('Items:', { underline: true });
-  doc.moveDown(0.5);
-
-  const purchases = db.purchases().filter(p => p.orderId === orderId || p.id === orderId);
-  purchases.forEach((p, idx) => {
-    doc.fontSize(12).text(`${idx + 1}. ${p.projectTitle || 'Project'} - $${p.price || 0}`);
-  });
-
-  doc.moveDown(1);
-  doc.fontSize(14).text('Summary:', { underline: true });
-  doc.fontSize(12).text(`Total Before: $${inv.totalBefore || 0}`);
-  doc.text(`Discount: $${inv.totalDiscount || 0}`);
-  doc.text(`Total After: $${inv.totalAfter || 0}`);
-
-  doc.end();
+  renderInvoicePdf({ res, inv });
 });
 
 // Mobile API - Subscriptions
@@ -1469,57 +2300,61 @@ app.post('/project/:id/reviews', requireAuth, (req, res) => {
   res.redirect(`/project/${project.id}`);
 });
 
-// Purchase - creates pending purchase request
-app.post('/purchase/:id', requireAuth, (req, res) => {
-  const projects = db.projects();
-  const project = projects.find(p => p.id === req.params.id);
-  if (!project) return res.status(404).send('Project not found');
-
-  if (!isProjectVisibleToUser({ project, sessionUser: req.session.user })) {
-    return res.status(403).send('Not allowed');
-  }
-  
-  const purchases = db.purchases();
-  const alreadyPurchased = purchases.find(p => p.userId === req.session.user.id && p.projectId === project.id);
-  
-  if (alreadyPurchased) {
-    return res.redirect('/my-purchases');
-  }
-
+const finalizeSingleProjectPurchase = ({ buyerUserId, payerUserId, projectId, couponCode, referralCode }) => {
   const users = db.users();
-  const currentUserIndex = users.findIndex(u => u.id === req.session.user.id);
-  const currentUser = currentUserIndex !== -1 ? users[currentUserIndex] : null;
-  if (!currentUser) return res.status(404).send('User not found');
+  const buyerIndex = users.findIndex(u => u && u.id === buyerUserId && u.role === 'user');
+  const payerIndex = users.findIndex(u => u && u.id === payerUserId && u.role === 'user');
+  if (buyerIndex === -1) throw new Error('المشتري غير موجود');
+  if (payerIndex === -1) throw new Error('صاحب البطاقة غير موجود');
 
-  const referralInput = normalizeReferralCode(req.body.referralCode);
-  const hasAnyPurchase = purchases.some(p => p.userId === req.session.user.id);
-  const canApplyReferralNow = !currentUser.referredBy && !hasAnyPurchase;
-  if (referralInput && !canApplyReferralNow) {
-    return res.redirect(`/project/${project.id}?referralError=${encodeURIComponent('لا يمكنك استخدام كود إحالة الآن')}`);
+  const buyer = users[buyerIndex];
+  const payer = users[payerIndex];
+  let shouldSaveUsers = false;
+
+  if (ensureUserPaymentProfile({ user: buyer, users })) shouldSaveUsers = true;
+  if (ensureUserPaymentProfile({ user: payer, users })) shouldSaveUsers = true;
+
+  const projects = db.projects();
+  const project = projects.find(p => p && p.id === projectId);
+  if (!project) throw new Error('المشروع غير موجود');
+
+  const purchases = db.purchases();
+  const alreadyPurchased = purchases.find(p => p && p.userId === buyer.id && p.projectId === project.id);
+  if (alreadyPurchased) throw new Error('تم شراء هذا المشروع بالفعل');
+
+  if (!isProjectVisibleToUser({ project, sessionUser: buildSessionUser(buyer) })) {
+    throw new Error('هذا المشروع غير متاح لهذا الحساب');
   }
-  if (referralInput && canApplyReferralNow) {
-    const referralCheck = validateReferralCodeForUser({ users, code: referralInput, targetUserId: req.session.user.id });
-    if (!referralCheck.valid) {
-      return res.redirect(`/project/${project.id}?referralError=${encodeURIComponent(referralCheck.reason || 'كود الإحالة غير صحيح')}`);
+
+  const normalizedReferral = normalizeReferralCode(referralCode);
+  if (normalizedReferral) {
+    const hasAnyPurchase = purchases.some(p => p && p.userId === buyer.id);
+    const canApplyReferralNow = !buyer.referredBy && !hasAnyPurchase;
+    if (!canApplyReferralNow) {
+      throw new Error('لا يمكنك استخدام كود الإحالة الآن');
     }
 
-    currentUser.referredBy = {
+    const referralCheck = validateReferralCodeForUser({ users, code: normalizedReferral, targetUserId: buyer.id });
+    if (!referralCheck.valid) {
+      throw new Error(referralCheck.reason || 'كود الإحالة غير صحيح');
+    }
+
+    buyer.referredBy = {
       referrerUserId: referralCheck.referrerUserId,
       code: referralCheck.normalized,
       createdAt: new Date().toISOString(),
       rewardedAt: null
     };
-    users[currentUserIndex] = currentUser;
-    db.saveUsers(users);
+    shouldSaveUsers = true;
 
     const referrals = db.referrals();
-    const alreadyRecorded = referrals.some(r => r.referredUserId === currentUser.id);
+    const alreadyRecorded = referrals.some(r => r && r.referredUserId === buyer.id);
     if (!alreadyRecorded) {
       referrals.push({
         id: uuidv4(),
         code: referralCheck.normalized,
         referrerUserId: referralCheck.referrerUserId,
-        referredUserId: currentUser.id,
+        referredUserId: buyer.id,
         status: 'pending',
         rewardAmount: 100,
         createdAt: new Date().toISOString(),
@@ -1530,68 +2365,66 @@ app.post('/purchase/:id', requireAuth, (req, res) => {
     }
   }
 
-  const couponCode = normalizeCouponCode(req.body.couponCode);
+  const normalizedCouponCode = normalizeCouponCode(couponCode);
   let appliedCoupon = null;
   let discountAmount = 0;
   let priceAfterDiscount = Number(project.price || 0);
-
   let coupons = null;
   let couponIndex = -1;
 
-  if (couponCode) {
+  if (normalizedCouponCode) {
     coupons = db.coupons();
-    couponIndex = coupons.findIndex(c => normalizeCouponCode(c.code) === couponCode);
+    couponIndex = coupons.findIndex(c => c && normalizeCouponCode(c.code) === normalizedCouponCode);
     const coupon = couponIndex !== -1 ? coupons[couponIndex] : null;
     const eligibility = getCouponEligibility(coupon);
-
     if (!eligibility.eligible) {
-      return res.redirect(`/project/${project.id}?couponError=${encodeURIComponent(eligibility.reason || 'كوبون غير صالح')}`);
+      throw new Error(eligibility.reason || 'الكوبون غير صالح');
     }
 
     const calc = calculateDiscount({ priceBefore: project.price, coupon });
     discountAmount = calc.discountAmount;
     priceAfterDiscount = calc.priceAfter;
-
     appliedCoupon = coupon;
   }
 
-  // Subscriber discount applied after coupon discount (if any)
-  const subPercent = getSubscriberDiscountPercent({ sessionUser: req.session.user });
+  const subPercent = getSubscriberDiscountPercent({ sessionUser: buildSessionUser(buyer) });
   if (subPercent > 0) {
     const base = Number(priceAfterDiscount || 0);
-    const subDiscount = Math.round((base * (subPercent / 100)) * 100) / 100;
-    discountAmount = Math.round((Number(discountAmount || 0) + subDiscount) * 100) / 100;
-    priceAfterDiscount = Math.round((base - subDiscount) * 100) / 100;
+    const subscriberDiscount = Math.round((base * (subPercent / 100)) * 100) / 100;
+    discountAmount = Math.round((Number(discountAmount || 0) + subscriberDiscount) * 100) / 100;
+    priceAfterDiscount = Math.round((base - subscriberDiscount) * 100) / 100;
   }
 
-  const walletBalance = Number(currentUser.walletBalance || 0);
-  if (walletBalance < Number(priceAfterDiscount || 0)) {
-    return res.redirect(`/project/${project.id}?couponError=${encodeURIComponent('رصيد المحفظة غير كافٍ')}`);
+  const payerWalletBalance = Number(payer.walletBalance || 0);
+  if (payerWalletBalance < Number(priceAfterDiscount || 0)) {
+    throw new Error('رصيد البطاقة غير كافٍ');
   }
 
-  currentUser.walletBalance = Math.round((walletBalance - Number(priceAfterDiscount || 0)) * 100) / 100;
+  payer.walletBalance = Math.round((payerWalletBalance - Number(priceAfterDiscount || 0)) * 100) / 100;
+  shouldSaveUsers = true;
 
   const earnedPoints = getLoyaltyEarnedPointsForPurchase({ amountEGP: Number(priceAfterDiscount || 0) });
   if (earnedPoints > 0) {
-    currentUser.loyaltyPoints = normalizeLoyaltyPoints(currentUser.loyaltyPoints) + earnedPoints;
+    buyer.loyaltyPoints = normalizeLoyaltyPoints(buyer.loyaltyPoints) + earnedPoints;
+    shouldSaveUsers = true;
   }
 
-  users[currentUserIndex] = currentUser;
-  db.saveUsers(users);
-
-  req.session.user = {
-    ...req.session.user,
-    walletBalance: Number(currentUser.walletBalance || 0)
-  };
+  if (shouldSaveUsers) {
+    users[buyerIndex] = buyer;
+    users[payerIndex] = payer;
+    db.saveUsers(users);
+  }
 
   if (appliedCoupon && coupons && couponIndex !== -1) {
     coupons[couponIndex].usedCount = Number(coupons[couponIndex].usedCount || 0) + 1;
     db.saveCoupons(coupons);
   }
-  
+
   purchases.push({
     id: uuidv4(),
-    userId: req.session.user.id,
+    userId: buyer.id,
+    payerUserId: payer.id,
+    payerCardLast4: normalizeWalletCardNumber(payer.walletCardNumber).slice(-4),
     projectId: project.id,
     projectTitle: project.title,
     price: priceAfterDiscount,
@@ -1606,9 +2439,202 @@ app.post('/purchase/:id', requireAuth, (req, res) => {
     filePath: project.filePath,
     originalFileName: project.originalFileName || null
   });
-  
+
   db.savePurchases(purchases);
-  res.redirect('/my-purchases');
+  return { buyer, payer };
+};
+
+const finalizeCartPurchase = ({ buyerUserId, payerUserId, projectIds, couponCode }) => {
+  const users = db.users();
+  const buyerIndex = users.findIndex(u => u && u.id === buyerUserId && u.role === 'user');
+  const payerIndex = users.findIndex(u => u && u.id === payerUserId && u.role === 'user');
+  if (buyerIndex === -1) throw new Error('المشتري غير موجود');
+  if (payerIndex === -1) throw new Error('صاحب البطاقة غير موجود');
+
+  const buyer = users[buyerIndex];
+  const payer = users[payerIndex];
+  let shouldSaveUsers = false;
+
+  if (ensureUserPaymentProfile({ user: buyer, users })) shouldSaveUsers = true;
+  if (ensureUserPaymentProfile({ user: payer, users })) shouldSaveUsers = true;
+
+  const normalizedProjectIds = Array.isArray(projectIds) ? projectIds.filter(Boolean) : [];
+  if (!normalizedProjectIds.length) throw new Error('لا توجد عناصر لإتمام الدفع');
+
+  const projects = db.projects();
+  const purchases = db.purchases();
+  const buyerSession = buildSessionUser(buyer);
+
+  const cartItems = normalizedProjectIds.map(projectId => {
+    const project = projects.find(p => p && p.id === projectId);
+    if (!project) throw new Error('يوجد مشروع غير موجود في عملية الدفع');
+    if (!isProjectVisibleToUser({ project, sessionUser: buyerSession })) {
+      throw new Error('يوجد مشروع غير مسموح لك بشرائه');
+    }
+    const alreadyPurchased = purchases.some(p => p && p.userId === buyer.id && p.projectId === project.id);
+    if (alreadyPurchased) throw new Error('يوجد مشروع تم شراؤه مسبقاً');
+    return {
+      projectId: project.id,
+      projectTitle: project.title,
+      price: Number(project.price || 0),
+      project
+    };
+  });
+
+  const summary = summarizeCart({
+    cart: { items: cartItems.map(item => ({ projectId: item.projectId, projectTitle: item.projectTitle, price: item.price })) },
+    couponCode,
+    sessionUser: buyerSession
+  });
+  const totalAfter = Number(summary.totalAfter || 0);
+  if (!(totalAfter > 0)) throw new Error('إجمالي الدفع غير صحيح');
+
+  const payerWalletBalance = Number(payer.walletBalance || 0);
+  if (payerWalletBalance < totalAfter) {
+    throw new Error('رصيد البطاقة غير كافٍ');
+  }
+
+  payer.walletBalance = Math.round((payerWalletBalance - totalAfter) * 100) / 100;
+  shouldSaveUsers = true;
+
+  const earnedPoints = getLoyaltyEarnedPointsForPurchase({ amountEGP: totalAfter });
+  if (earnedPoints > 0) {
+    buyer.loyaltyPoints = normalizeLoyaltyPoints(buyer.loyaltyPoints) + earnedPoints;
+    shouldSaveUsers = true;
+  }
+
+  if (summary.appliedCoupon) {
+    const coupons = db.coupons();
+    const couponIndex = coupons.findIndex(c => c && normalizeCouponCode(c.code) === normalizeCouponCode(summary.appliedCoupon.code));
+    if (couponIndex !== -1) {
+      coupons[couponIndex].usedCount = Number(coupons[couponIndex].usedCount || 0) + 1;
+      db.saveCoupons(coupons);
+    }
+  }
+
+  if (shouldSaveUsers) {
+    users[buyerIndex] = buyer;
+    users[payerIndex] = payer;
+    db.saveUsers(users);
+  }
+
+  const orderId = uuidv4();
+  const totalDiscount = Math.round((Number(summary.couponDiscount || 0) + Number(summary.subscriberDiscount || 0)) * 100) / 100;
+  const perItemDiscount = cartItems.length ? Math.round((totalDiscount / cartItems.length) * 100) / 100 : 0;
+  const perItemDebit = cartItems.length ? Math.round((totalAfter / cartItems.length) * 100) / 100 : 0;
+
+  cartItems.forEach(item => {
+    purchases.push({
+      id: uuidv4(),
+      orderId,
+      userId: buyer.id,
+      payerUserId: payer.id,
+      payerCardLast4: normalizeWalletCardNumber(payer.walletCardNumber).slice(-4),
+      projectId: item.projectId,
+      projectTitle: item.projectTitle,
+      price: Math.max(0, Math.round((Number(item.price || 0) - perItemDiscount) * 100) / 100),
+      priceBefore: Number(item.price || 0),
+      discountAmount: perItemDiscount,
+      couponCode: summary.appliedCoupon ? normalizeCouponCode(summary.appliedCoupon.code) : null,
+      walletDebitAmount: perItemDebit,
+      walletRefundedAt: null,
+      loyaltyPointsEarned: null,
+      status: 'pending',
+      purchasedAt: new Date().toISOString(),
+      filePath: item.project.filePath,
+      originalFileName: item.project.originalFileName || null
+    });
+  });
+
+  db.savePurchases(purchases);
+
+  const { carts, cart, cartIndex } = getOrCreateCartForUser({ userId: buyer.id });
+  const targetIds = new Set(normalizedProjectIds);
+  const nextItems = (Array.isArray(cart.items) ? cart.items : []).filter(item => item && !targetIds.has(item.projectId));
+  carts[cartIndex] = { ...cart, items: nextItems, updatedAt: new Date().toISOString() };
+  db.saveCarts(carts);
+
+  return { buyer, payer };
+};
+
+// Purchase - creates pending payment verification request
+app.post('/purchase/:id', requireAuth, async (req, res) => {
+  try {
+    const projects = db.projects();
+    const project = projects.find(p => p && p.id === req.params.id);
+    if (!project) return res.status(404).send('Project not found');
+
+    const users = db.users();
+    const buyer = users.find(u => u && u.id === req.session.user.id && u.role === 'user');
+    if (!buyer) return res.status(404).send('User not found');
+    if (ensureUserPaymentProfile({ user: buyer, users })) {
+      db.saveUsers(users);
+    }
+
+    if (!isProjectVisibleToUser({ project, sessionUser: buildSessionUser(buyer) })) {
+      return res.status(403).send('Not allowed');
+    }
+
+    const purchases = db.purchases();
+    const alreadyPurchased = purchases.find(p => p && p.userId === buyer.id && p.projectId === project.id);
+    if (alreadyPurchased) {
+      return res.redirect('/my-purchases');
+    }
+
+    const couponCode = normalizeCouponCode(req.body.couponCode);
+    let priceAfterDiscount = Number(project.price || 0);
+    if (couponCode) {
+      const coupons = db.coupons();
+      const coupon = coupons.find(c => c && normalizeCouponCode(c.code) === couponCode) || null;
+      const eligibility = getCouponEligibility(coupon);
+      if (!eligibility.eligible) {
+        return res.redirect(`/project/${project.id}?couponError=${encodeURIComponent(eligibility.reason || 'كوبون غير صالح')}`);
+      }
+      const calc = calculateDiscount({ priceBefore: project.price, coupon });
+      priceAfterDiscount = calc.priceAfter;
+    }
+
+    const subPercent = getSubscriberDiscountPercent({ sessionUser: buildSessionUser(buyer) });
+    if (subPercent > 0) {
+      priceAfterDiscount = Math.round((Number(priceAfterDiscount || 0) * (1 - (subPercent / 100))) * 100) / 100;
+    }
+
+    const enteredCardNumber = normalizeWalletCardNumber(req.body.walletCardNumber) || normalizeWalletCardNumber(buyer.walletCardNumber);
+    const payer = findUserByWalletCardNumber({ users, walletCardNumber: enteredCardNumber });
+    if (!payer) {
+      return res.redirect(`/project/${project.id}?couponError=${encodeURIComponent('رقم بطاقة المحفظة غير صحيح')}`);
+    }
+    if (ensureUserPaymentProfile({ user: payer, users })) {
+      db.saveUsers(users);
+    }
+
+    if (Number(payer.walletBalance || 0) < Number(priceAfterDiscount || 0)) {
+      return res.redirect(`/project/${project.id}?couponError=${encodeURIComponent('رصيد البطاقة غير كافٍ')}`);
+    }
+
+    if (Number(priceAfterDiscount || 0) > HIGH_VALUE_PAYMENT_THRESHOLD && !payer.walletPaymentPasswordHash) {
+      return res.redirect(`/project/${project.id}?couponError=${encodeURIComponent('صاحب البطاقة لم يضبط كلمة مرور البطاقة بعد')}`);
+    }
+
+    const attempt = await createWalletPaymentAttempt({
+      buyerUser: buyer,
+      payerUser: payer,
+      amount: priceAfterDiscount,
+      kind: 'single-project',
+      payload: {
+        projectId: project.id,
+        couponCode,
+        referralCode: normalizeReferralCode(req.body.referralCode)
+      }
+    });
+
+    return res.redirect(`/payment/verify/${attempt.id}`);
+  } catch (error) {
+    const message = error && error.message === 'SMTP is not configured'
+      ? 'خدمة إرسال البريد غير مفعلة. أضف إعدادات SMTP أولاً.'
+      : 'تعذر إرسال كود التحقق الآن';
+    return res.redirect(`/project/${req.params.id}?couponError=${encodeURIComponent(message)}`);
+  }
 });
 
 // Cart
@@ -1618,10 +2644,10 @@ app.get('/cart', requireAuth, (req, res) => {
   const users = db.users();
   const currentUser = users.find(u => u.id === req.session.user.id);
   if (currentUser) {
-    req.session.user = {
-      ...req.session.user,
-      walletBalance: Number(currentUser.walletBalance || 0)
-    };
+    if (ensureUserPaymentProfile({ user: currentUser, users })) {
+      db.saveUsers(users);
+    }
+    req.session.user = buildSessionUser(currentUser);
   }
 
   const { carts, cart, cartIndex } = getOrCreateCartForUser({ userId: req.session.user.id });
@@ -1636,6 +2662,7 @@ app.get('/cart', requireAuth, (req, res) => {
     cart,
     summary,
     couponCode,
+    walletCardNumber: currentUser ? formatWalletCardNumber(currentUser.walletCardNumber) : '',
     error: req.query.error || null
   });
 });
@@ -1691,99 +2718,184 @@ app.post('/cart/clear', requireAuth, (req, res) => {
   res.redirect('/cart');
 });
 
-app.post('/cart/checkout', requireAuth, (req, res) => {
+app.post('/cart/checkout', requireAuth, async (req, res) => {
   if (!req.session.user || req.session.user.role !== 'user') return res.redirect('/');
 
-  const { carts, cart, cartIndex } = getOrCreateCartForUser({ userId: req.session.user.id });
-  const items = (cart && Array.isArray(cart.items)) ? cart.items : [];
-  if (items.length === 0) return res.redirect('/cart?error=' + encodeURIComponent('السلة فارغة'));
+  try {
+    const { cart } = getOrCreateCartForUser({ userId: req.session.user.id });
+    const items = (cart && Array.isArray(cart.items)) ? cart.items : [];
+    if (items.length === 0) return res.redirect('/cart?error=' + encodeURIComponent('السلة فارغة'));
+
+    const users = db.users();
+    const buyer = users.find(u => u && u.id === req.session.user.id && u.role === 'user');
+    if (!buyer) return res.status(404).send('User not found');
+    if (ensureUserPaymentProfile({ user: buyer, users })) {
+      db.saveUsers(users);
+    }
+
+    const projects = db.projects();
+    const purchases = db.purchases();
+    const couponCode = normalizeCouponCode(req.body.couponCode);
+    const summary = summarizeCart({ cart, couponCode, sessionUser: buildSessionUser(buyer) });
+    const totalAfter = Number(summary.totalAfter || 0);
+    if (!(totalAfter > 0)) return res.redirect('/cart?error=' + encodeURIComponent('إجمالي غير صحيح'));
+
+    for (const item of items) {
+      const project = projects.find(p => p && p.id === item.projectId);
+      if (!project) return res.redirect('/cart?error=' + encodeURIComponent('يوجد مشروع غير موجود بالسلة'));
+      if (!isProjectVisibleToUser({ project, sessionUser: buildSessionUser(buyer) })) {
+        return res.redirect('/cart?error=' + encodeURIComponent('يوجد مشروع غير مسموح لك بشرائه'));
+      }
+      const alreadyPurchased = purchases.some(p => p && p.userId === buyer.id && p.projectId === item.projectId);
+      if (alreadyPurchased) {
+        return res.redirect('/cart?error=' + encodeURIComponent('يوجد مشروع تم شراؤه مسبقاً'));
+      }
+    }
+
+    const enteredCardNumber = normalizeWalletCardNumber(req.body.walletCardNumber) || normalizeWalletCardNumber(buyer.walletCardNumber);
+    const payer = findUserByWalletCardNumber({ users, walletCardNumber: enteredCardNumber });
+    if (!payer) {
+      return res.redirect('/cart?error=' + encodeURIComponent('رقم بطاقة المحفظة غير صحيح'));
+    }
+    if (ensureUserPaymentProfile({ user: payer, users })) {
+      db.saveUsers(users);
+    }
+
+    if (Number(payer.walletBalance || 0) < totalAfter) {
+      return res.redirect('/cart?error=' + encodeURIComponent('رصيد البطاقة غير كافٍ'));
+    }
+
+    if (totalAfter > HIGH_VALUE_PAYMENT_THRESHOLD && !payer.walletPaymentPasswordHash) {
+      return res.redirect('/cart?error=' + encodeURIComponent('صاحب البطاقة لم يضبط كلمة مرور البطاقة بعد'));
+    }
+
+    const attempt = await createWalletPaymentAttempt({
+      buyerUser: buyer,
+      payerUser: payer,
+      amount: totalAfter,
+      kind: 'cart',
+      payload: {
+        projectIds: items.map(item => item.projectId),
+        couponCode
+      }
+    });
+
+    return res.redirect(`/payment/verify/${attempt.id}`);
+  } catch (error) {
+    const message = error && error.message === 'SMTP is not configured'
+      ? 'خدمة إرسال البريد غير مفعلة. أضف إعدادات SMTP أولاً.'
+      : 'تعذر إرسال كود التحقق الآن';
+    return res.redirect('/cart?error=' + encodeURIComponent(message));
+  }
+});
+
+app.get('/payment/verify/:attemptId', requireAuth, (req, res) => {
+  if (!req.session.user || req.session.user.role !== 'user') return res.redirect('/');
+
+  const attempt = getWalletPaymentAttemptById(req.params.attemptId);
+  if (!attempt || attempt.buyerUserId !== req.session.user.id) {
+    return res.redirect('/cart?error=' + encodeURIComponent('طلب التحقق غير موجود'));
+  }
+
+  if (attempt.usedAt) {
+    return res.redirect('/my-purchases?paymentError=' + encodeURIComponent('تم استخدام طلب التحقق بالفعل'));
+  }
+
+  if (isPaymentAttemptExpired(attempt)) {
+    return res.redirect('/cart?error=' + encodeURIComponent('انتهت صلاحية كود التحقق. حاول مرة أخرى'));
+  }
 
   const users = db.users();
-  const currentUserIndex = users.findIndex(u => u.id === req.session.user.id);
-  const currentUser = currentUserIndex !== -1 ? users[currentUserIndex] : null;
-  if (!currentUser) return res.status(404).send('User not found');
-
-  const projects = db.projects();
-  const purchases = db.purchases();
-
-  const couponCode = normalizeCouponCode(req.body.couponCode);
-  const summary = summarizeCart({ cart, couponCode, sessionUser: req.session.user });
-  const totalAfter = Number(summary.totalAfter || 0);
-  if (!(totalAfter > 0)) return res.redirect('/cart?error=' + encodeURIComponent('إجمالي غير صحيح'));
-
-  const walletBalance = Number(currentUser.walletBalance || 0);
-  if (walletBalance < totalAfter) {
-    return res.redirect('/cart?error=' + encodeURIComponent('رصيد المحفظة غير كافٍ'));
+  const payer = users.find(u => u && u.id === attempt.payerUserId) || null;
+  if (!payer) {
+    return res.redirect('/cart?error=' + encodeURIComponent('صاحب البطاقة غير موجود'));
   }
 
-  // validate all items still purchasable
-  for (const it of items) {
-    const p = projects.find(pp => pp && pp.id === it.projectId);
-    if (!p) return res.redirect('/cart?error=' + encodeURIComponent('يوجد مشروع غير موجود بالسلة'));
-    if (!isProjectVisibleToUser({ project: p, sessionUser: req.session.user })) {
-      return res.redirect('/cart?error=' + encodeURIComponent('يوجد مشروع غير مسموح لك بشرائه'));
+  return res.render('payment-verify', {
+    user: req.session.user,
+    attempt,
+    amount: Number(attempt.amount || 0),
+    payerEmailMasked: maskEmail(payer.email),
+    payerName: payer.name || payer.email || 'صاحب البطاقة',
+    walletCardMasked: maskWalletCardNumber(payer.walletCardNumber),
+    requiresPassword: Number(attempt.amount || 0) > HIGH_VALUE_PAYMENT_THRESHOLD,
+    error: req.query.error || null
+  });
+});
+
+app.post('/payment/verify/:attemptId', requireAuth, (req, res) => {
+  if (!req.session.user || req.session.user.role !== 'user') return res.redirect('/');
+
+  const attempt = getWalletPaymentAttemptById(req.params.attemptId);
+  if (!attempt || attempt.buyerUserId !== req.session.user.id) {
+    return res.redirect('/cart?error=' + encodeURIComponent('طلب التحقق غير موجود'));
+  }
+
+  if (attempt.usedAt) {
+    return res.redirect('/my-purchases?paymentError=' + encodeURIComponent('تم استخدام طلب التحقق بالفعل'));
+  }
+
+  if (isPaymentAttemptExpired(attempt)) {
+    return res.redirect('/cart?error=' + encodeURIComponent('انتهت صلاحية كود التحقق. حاول مرة أخرى'));
+  }
+
+  const verificationCode = String(req.body.code || '').trim();
+  if (!verificationCode || hashPaymentVerificationCode(verificationCode) !== attempt.codeHash) {
+    return res.redirect(`/payment/verify/${attempt.id}?error=${encodeURIComponent('كود التحقق غير صحيح')}`);
+  }
+
+  const users = db.users();
+  const payer = users.find(u => u && u.id === attempt.payerUserId && u.role === 'user');
+  if (!payer) {
+    return res.redirect('/cart?error=' + encodeURIComponent('صاحب البطاقة غير موجود'));
+  }
+
+  if (Number(attempt.amount || 0) > HIGH_VALUE_PAYMENT_THRESHOLD) {
+    const paymentPassword = String(req.body.paymentPassword || '');
+    if (!payer.walletPaymentPasswordHash) {
+      return res.redirect(`/payment/verify/${attempt.id}?error=${encodeURIComponent('صاحب البطاقة لم يضبط كلمة مرور البطاقة بعد')}`);
     }
-    const already = purchases.some(x => x.userId === req.session.user.id && x.projectId === it.projectId);
-    if (already) return res.redirect('/cart?error=' + encodeURIComponent('يوجد مشروع تم شراؤه مسبقاً'));
-  }
-
-  // debit wallet once
-  currentUser.walletBalance = Math.round((walletBalance - totalAfter) * 100) / 100;
-
-  const earnedPoints = getLoyaltyEarnedPointsForPurchase({ amountEGP: totalAfter });
-  if (earnedPoints > 0) {
-    currentUser.loyaltyPoints = normalizeLoyaltyPoints(currentUser.loyaltyPoints) + earnedPoints;
-  }
-
-  // increment coupon usage (if valid)
-  if (summary.appliedCoupon) {
-    const coupons = db.coupons();
-    const idx = coupons.findIndex(c => c && normalizeCouponCode(c.code) === normalizeCouponCode(summary.appliedCoupon.code));
-    if (idx !== -1) {
-      coupons[idx].usedCount = Number(coupons[idx].usedCount || 0) + 1;
-      db.saveCoupons(coupons);
+    if (!paymentPassword || !bcrypt.compareSync(paymentPassword, payer.walletPaymentPasswordHash)) {
+      return res.redirect(`/payment/verify/${attempt.id}?error=${encodeURIComponent('كلمة مرور البطاقة غير صحيحة')}`);
     }
   }
 
-  users[currentUserIndex] = currentUser;
-  db.saveUsers(users);
-  req.session.user = { ...req.session.user, walletBalance: Number(currentUser.walletBalance || 0) };
+  try {
+    let result = null;
 
-  const orderId = uuidv4();
-  const totalBefore = Number(summary.totalBefore || 0);
-  const totalDiscount = Math.round((Number(summary.couponDiscount || 0) + Number(summary.subscriberDiscount || 0)) * 100) / 100;
-  const perItemDiscount = items.length ? Math.round((totalDiscount / items.length) * 100) / 100 : 0;
-  const perItemDebit = items.length ? Math.round((totalAfter / items.length) * 100) / 100 : 0;
+    if (attempt.kind === 'single-project') {
+      result = finalizeSingleProjectPurchase({
+        buyerUserId: attempt.buyerUserId,
+        payerUserId: attempt.payerUserId,
+        projectId: attempt.payload && attempt.payload.projectId,
+        couponCode: attempt.payload && attempt.payload.couponCode,
+        referralCode: attempt.payload && attempt.payload.referralCode
+      });
+    } else if (attempt.kind === 'cart') {
+      result = finalizeCartPurchase({
+        buyerUserId: attempt.buyerUserId,
+        payerUserId: attempt.payerUserId,
+        projectIds: attempt.payload && attempt.payload.projectIds,
+        couponCode: attempt.payload && attempt.payload.couponCode
+      });
+    } else {
+      throw new Error('نوع عملية الدفع غير مدعوم');
+    }
 
-  for (const it of items) {
-    const project = projects.find(pp => pp && pp.id === it.projectId);
-    purchases.push({
-      id: uuidv4(),
-      orderId,
-      userId: req.session.user.id,
-      projectId: project.id,
-      projectTitle: project.title,
-      price: Math.max(0, Math.round((Number(project.price || 0) - perItemDiscount) * 100) / 100),
-      priceBefore: Number(project.price || 0),
-      discountAmount: perItemDiscount,
-      couponCode: summary.appliedCoupon ? normalizeCouponCode(summary.appliedCoupon.code) : null,
-      walletDebitAmount: perItemDebit,
-      walletRefundedAt: null,
-      loyaltyPointsEarned: null,
-      status: 'pending',
-      purchasedAt: new Date().toISOString(),
-      filePath: project.filePath,
-      originalFileName: project.originalFileName || null
-    });
+    markWalletPaymentAttemptUsed(attempt.id);
+
+    if (result && result.buyer) {
+      req.session.user = buildSessionUser(result.buyer);
+    }
+
+    return res.redirect('/my-purchases?paymentSuccess=' + encodeURIComponent('تم تأكيد الدفع وإرسال الطلب بنجاح'));
+  } catch (error) {
+    const fallbackTarget = attempt.kind === 'single-project' && attempt.payload && attempt.payload.projectId
+      ? `/project/${attempt.payload.projectId}`
+      : '/cart';
+    const message = error && error.message ? error.message : 'تعذر إتمام الدفع بعد التحقق';
+    return res.redirect(`/payment/verify/${attempt.id}?error=${encodeURIComponent(message)}&back=${encodeURIComponent(fallbackTarget)}`);
   }
-
-  db.savePurchases(purchases);
-
-  // clear cart
-  carts[cartIndex] = { ...cart, items: [], updatedAt: new Date().toISOString() };
-  db.saveCarts(carts);
-
-  res.redirect('/my-purchases');
 });
 
 // My purchases
@@ -1791,12 +2903,10 @@ app.get('/my-purchases', requireAuth, (req, res) => {
   const users = db.users();
   const currentUser = users.find(u => u.id === req.session.user.id);
   if (currentUser) {
-    req.session.user = {
-      ...req.session.user,
-      referralCode: currentUser.referralCode || null,
-      walletBalance: Number(currentUser.walletBalance || 0),
-      loyaltyPoints: normalizeLoyaltyPoints(currentUser.loyaltyPoints)
-    };
+    if (ensureUserPaymentProfile({ user: currentUser, users })) {
+      db.saveUsers(users);
+    }
+    req.session.user = buildSessionUser(currentUser);
   }
   const purchases = db.purchases().filter(p => p.userId === req.session.user.id);
   const invoices = db.invoices().filter(i => i && i.userId === req.session.user.id);
@@ -1809,6 +2919,11 @@ app.get('/my-purchases', requireAuth, (req, res) => {
     user: req.session.user,
     redeemError: req.query.redeemError || null,
     redeemSuccess: req.query.redeemSuccess || null,
+    walletCardError: req.query.walletCardError || null,
+    walletCardSuccess: req.query.walletCardSuccess || null,
+    paymentError: req.query.paymentError || null,
+    paymentSuccess: req.query.paymentSuccess || null,
+    walletCardNumber: currentUser ? formatWalletCardNumber(currentUser.walletCardNumber) : null,
     subscriptionPlans,
     subscriptions,
     subscriptionPayments
@@ -1920,6 +3035,29 @@ app.post('/wallet/redeem', requireAuth, (req, res) => {
   };
 
   return res.redirect(`/my-purchases?redeemSuccess=${encodeURIComponent('تم إضافة الرصيد بنجاح')}`);
+});
+
+app.post('/wallet-card/password', requireAuth, (req, res) => {
+  if (!req.session.user || req.session.user.role !== 'user') return res.redirect('/');
+
+  const nextPassword = String(req.body.walletPassword || '').trim();
+  if (nextPassword.length < 4) {
+    return res.redirect(`/my-purchases?walletCardError=${encodeURIComponent('كلمة مرور البطاقة يجب ألا تقل عن 4 أحرف أو أرقام')}`);
+  }
+
+  const users = db.users();
+  const userIndex = users.findIndex(u => u && u.id === req.session.user.id && u.role === 'user');
+  if (userIndex === -1) return res.status(404).send('User not found');
+
+  if (ensureUserPaymentProfile({ user: users[userIndex], users })) {
+    // profile fields are updated in place before saving
+  }
+
+  users[userIndex].walletPaymentPasswordHash = bcrypt.hashSync(nextPassword, 10);
+  db.saveUsers(users);
+  req.session.user = buildSessionUser(users[userIndex]);
+
+  return res.redirect(`/my-purchases?walletCardSuccess=${encodeURIComponent('تم تحديث كلمة مرور البطاقة بنجاح')}`);
 });
 
 // Protected download - only approved purchases can download
@@ -3155,35 +4293,7 @@ app.get('/invoice/:orderId.pdf', requireAuth, (req, res) => {
 
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `inline; filename="${inv.invoiceNumber || 'invoice'}.pdf"`);
-
-  const doc = new PDFDocument({ size: 'A4', margin: 50 });
-  doc.pipe(res);
-
-  doc.fontSize(18).text('Codentra - Invoice', { align: 'center' });
-  doc.moveDown(0.5);
-  doc.fontSize(12).text(`Invoice: ${inv.invoiceNumber || '-'}`);
-  doc.text(`Date: ${inv.createdAt ? new Date(inv.createdAt).toLocaleString('en-GB') : '-'}`);
-  doc.moveDown(0.5);
-  doc.text(`Customer: ${inv.userName || '-'}`);
-  if (inv.userEmail) doc.text(`Email: ${inv.userEmail}`);
-  if (inv.couponCode) doc.text(`Coupon: ${inv.couponCode}`);
-  doc.moveDown(1);
-
-  doc.fontSize(12).text('Items:', { underline: true });
-  doc.moveDown(0.5);
-
-  (inv.items || []).forEach((it, idx) => {
-    doc.fontSize(11).text(`${idx + 1}) ${it.projectTitle || it.projectId || '-'}`);
-    doc.fontSize(10).text(`   Before: ${formatMoney(it.priceBefore)} EGP | Discount: ${formatMoney(it.discountAmount)} EGP | After: ${formatMoney(it.priceAfter)} EGP`);
-    doc.moveDown(0.2);
-  });
-
-  doc.moveDown(1);
-  doc.fontSize(12).text(`Total Before: ${formatMoney(inv.totalBefore)} EGP`);
-  doc.text(`Total Discount: ${formatMoney(inv.totalDiscount)} EGP`);
-  doc.fontSize(14).text(`Total After: ${formatMoney(inv.totalAfter)} EGP`);
-
-  doc.end();
+  renderInvoicePdf({ res, inv, includeEmail: true, includeCoupon: true });
 });
 
 // Admin - Referrals
@@ -3203,7 +4313,8 @@ app.post('/admin/purchases/:id/reject', requireAdmin, (req, res) => {
     const refundAmount = calculateRefundForRejectedItem({ rejectedPurchase: purchase, allPurchases: purchases });
     if (refundAmount > 0 && !purchase.walletRefundedAt) {
       const users = db.users();
-      const userIndex = users.findIndex(u => u.id === purchase.userId);
+      const refundUserId = purchase.payerUserId || purchase.userId;
+      const userIndex = users.findIndex(u => u.id === refundUserId);
       if (userIndex !== -1) {
         users[userIndex].walletBalance = Math.round((Number(users[userIndex].walletBalance || 0) + refundAmount) * 100) / 100;
         db.saveUsers(users);
@@ -3487,6 +4598,280 @@ app.post('/subscriptions/cancel', requireAuth, (req, res) => {
   res.redirect('/subscriptions?success=' + encodeURIComponent('تم إلغاء الاشتراك'));
 });
 
+app.get('/codentra-presentations', (req, res) => {
+  const plans = ensurePresentationPlans();
+  let currentUser = null;
+  let activeSubscription = null;
+  let activePlan = null;
+  let decks = [];
+  let incomingApprovals = [];
+  let walletCardNumber = '';
+
+  if (req.session.user && req.session.user.role === 'user') {
+    const users = db.users();
+    const userIndex = users.findIndex((item) => item && item.id === req.session.user.id);
+    if (userIndex !== -1) {
+      currentUser = users[userIndex];
+      if (ensureUserPaymentProfile({ user: currentUser, users })) {
+        users[userIndex] = currentUser;
+        db.saveUsers(users);
+      }
+      req.session.user = buildSessionUser(currentUser);
+      activeSubscription = getActivePresentationSubscriptionForUser({ userId: currentUser.id });
+      activePlan = activeSubscription ? plans.find((plan) => plan.id === activeSubscription.planId) || null : null;
+      decks = getPresentationDecksForUser({ userId: currentUser.id, limit: 6 });
+      incomingApprovals = getPresentationIncomingApprovals({ ownerUserId: currentUser.id });
+      walletCardNumber = formatWalletCardNumber(currentUser.walletCardNumber);
+    }
+  }
+
+  res.render('presentations/home', {
+    user: req.session.user,
+    presentationUser: currentUser,
+    plans,
+    activeSubscription,
+    activePlan,
+    decks,
+    incomingApprovals,
+    walletCardNumber,
+    error: req.query.error || null,
+    success: req.query.success || null
+  });
+});
+
+app.get('/codentra-presentations/dashboard', (req, res) => {
+  res.redirect('/codentra-presentations');
+});
+
+app.post('/codentra-presentations/subscribe/:planId', requireAuth, (req, res) => {
+  if (!req.session.user || req.session.user.role !== 'user') return res.redirect('/');
+
+  try {
+    const plan = getPresentationPlanById({ planId: req.params.planId });
+    if (!plan) {
+      return res.redirect('/codentra-presentations?error=' + encodeURIComponent('الخطة غير موجودة'));
+    }
+
+    const users = db.users();
+    const buyer = users.find((item) => item && item.id === req.session.user.id && item.role === 'user');
+    if (!buyer) {
+      return res.redirect('/login');
+    }
+
+    let shouldSaveUsers = false;
+    if (ensureUserPaymentProfile({ user: buyer, users })) {
+      shouldSaveUsers = true;
+    }
+
+    const enteredCardNumber = normalizeWalletCardNumber(req.body.walletCardNumber) || normalizeWalletCardNumber(buyer.walletCardNumber);
+    const payer = findUserByWalletCardNumber({ users, walletCardNumber: enteredCardNumber });
+    if (!payer) {
+      return res.redirect('/codentra-presentations?error=' + encodeURIComponent('رقم بطاقة المحفظة غير صحيح'));
+    }
+
+    if (ensureUserPaymentProfile({ user: payer, users })) {
+      shouldSaveUsers = true;
+    }
+
+    if (shouldSaveUsers) {
+      db.saveUsers(users);
+    }
+
+    const attempt = createPresentationPaymentAttempt({ buyerUser: buyer, payerUser: payer, plan });
+    return res.redirect(`/codentra-presentations/payment/verify/${attempt.id}`);
+  } catch (error) {
+    const message = error && error.message ? error.message : 'تعذر بدء الاشتراك الآن';
+    return res.redirect('/codentra-presentations?error=' + encodeURIComponent(message));
+  }
+});
+
+app.get('/codentra-presentations/payment/verify/:attemptId', requireAuth, (req, res) => {
+  if (!req.session.user || req.session.user.role !== 'user') return res.redirect('/');
+
+  const attempt = getPresentationPaymentAttemptById({ attemptId: req.params.attemptId });
+  if (!attempt || attempt.buyerUserId !== req.session.user.id) {
+    return res.redirect('/codentra-presentations?error=' + encodeURIComponent('طلب التحقق غير موجود أو انتهت صلاحيته'));
+  }
+
+  const users = db.users();
+  const payer = users.find((item) => item && item.id === attempt.payerUserId) || null;
+  const plan = getPresentationPlanById({ planId: attempt.planId });
+
+  return res.render('presentations/payment-verify', {
+    user: req.session.user,
+    attempt,
+    plan,
+    payer,
+    walletCardNumber: payer ? formatWalletCardNumber(payer.walletCardNumber) : '',
+    ownerVisibleCode: payer && payer.id === req.session.user.id ? attempt.ownerVisibleCode : null,
+    error: req.query.error || null
+  });
+});
+
+app.post('/codentra-presentations/payment/verify/:attemptId', requireAuth, (req, res) => {
+  if (!req.session.user || req.session.user.role !== 'user') return res.redirect('/');
+
+  const attempt = getPresentationPaymentAttemptById({ attemptId: req.params.attemptId });
+  if (!attempt || attempt.buyerUserId !== req.session.user.id) {
+    return res.redirect('/codentra-presentations?error=' + encodeURIComponent('طلب التحقق غير موجود أو انتهت صلاحيته'));
+  }
+
+  const verificationCode = String(req.body.verificationCode || '').trim();
+  if (!verificationCode || hashPaymentVerificationCode(verificationCode) !== attempt.codeHash) {
+    return res.redirect(`/codentra-presentations/payment/verify/${attempt.id}?error=${encodeURIComponent('كود التحقق غير صحيح')}`);
+  }
+
+  const users = db.users();
+  const buyerIndex = users.findIndex((item) => item && item.id === req.session.user.id && item.role === 'user');
+  const payerIndex = users.findIndex((item) => item && item.id === attempt.payerUserId && item.role === 'user');
+  if (buyerIndex === -1 || payerIndex === -1) {
+    return res.redirect('/codentra-presentations?error=' + encodeURIComponent('تعذر العثور على المستخدم'));
+  }
+
+  const buyer = users[buyerIndex];
+  const payer = users[payerIndex];
+  if (ensureUserPaymentProfile({ user: buyer, users })) {
+    users[buyerIndex] = buyer;
+  }
+  if (ensureUserPaymentProfile({ user: payer, users })) {
+    users[payerIndex] = payer;
+  }
+
+  const plan = getPresentationPlanById({ planId: attempt.planId });
+  if (!plan) {
+    return res.redirect('/codentra-presentations?error=' + encodeURIComponent('الخطة غير موجودة'));
+  }
+
+  if (attempt.requiresPassword) {
+    const walletPassword = String(req.body.walletPassword || '');
+    if (!payer.walletPaymentPasswordHash || !bcrypt.compareSync(walletPassword, payer.walletPaymentPasswordHash)) {
+      return res.redirect(`/codentra-presentations/payment/verify/${attempt.id}?error=${encodeURIComponent('كلمة مرور البطاقة غير صحيحة')}`);
+    }
+  }
+
+  const amount = Number(plan.price || 0);
+  if (Number(payer.walletBalance || 0) < amount) {
+    return res.redirect('/codentra-presentations?error=' + encodeURIComponent('رصيد البطاقة غير كافٍ'));
+  }
+
+  payer.walletBalance = Math.round((Number(payer.walletBalance || 0) - amount) * 100) / 100;
+  users[buyerIndex] = buyer;
+  users[payerIndex] = payer;
+  db.saveUsers(users);
+
+  upsertPresentationSubscription({ userId: buyer.id, plan, payerUserId: payer.id });
+  markPresentationPaymentAttemptUsed({ attemptId: attempt.id });
+
+  req.session.user = buildSessionUser(buyer);
+  return res.redirect('/codentra-presentations?success=' + encodeURIComponent('تم تفعيل اشتراك Codentra Presentations بنجاح'));
+});
+
+app.get('/codentra-presentations/generate', requireAuth, (req, res) => {
+  if (!req.session.user || req.session.user.role !== 'user') return res.redirect('/');
+
+  const activeSubscription = getActivePresentationSubscriptionForUser({ userId: req.session.user.id });
+  if (!activeSubscription) {
+    return res.redirect('/codentra-presentations?error=' + encodeURIComponent('تحتاج اشتراكًا نشطًا للبدء'));
+  }
+
+  res.render('presentations/generate', {
+    user: req.session.user,
+    activeSubscription,
+    error: req.query.error || null
+  });
+});
+
+app.post('/codentra-presentations/generate', requireAuth, async (req, res) => {
+  if (!req.session.user || req.session.user.role !== 'user') return res.redirect('/');
+
+  const activeSubscription = getActivePresentationSubscriptionForUser({ userId: req.session.user.id });
+  if (!activeSubscription) {
+    return res.redirect('/codentra-presentations?error=' + encodeURIComponent('تحتاج اشتراكًا نشطًا للبدء'));
+  }
+
+  if (Number(activeSubscription.remainingCredits || 0) <= 0) {
+    return res.redirect('/codentra-presentations?error=' + encodeURIComponent('لا توجد عمليات إنشاء متبقية في اشتراكك'));
+  }
+
+  const topic = String(req.body.topic || '').trim();
+  const audience = String(req.body.audience || '').trim();
+  const tone = String(req.body.tone || '').trim();
+  const purpose = String(req.body.purpose || '').trim();
+  const language = req.body.language === 'en' ? 'en' : 'ar';
+  const slideCount = countPresentationSlides(req.body.slideCount);
+
+  if (!topic) {
+    return res.redirect('/codentra-presentations/generate?error=' + encodeURIComponent('اكتب موضوع العرض أولًا'));
+  }
+
+  const generated = await generatePresentationDeck({
+    topic,
+    audience,
+    tone,
+    purpose,
+    language,
+    slideCount
+  });
+
+  const decks = db.presentationDecks();
+  const deck = {
+    id: uuidv4(),
+    userId: req.session.user.id,
+    subscriptionId: activeSubscription.id,
+    topic,
+    audience,
+    tone,
+    purpose,
+    language,
+    title: generated.title,
+    subtitle: generated.subtitle,
+    theme: generated.theme,
+    slides: generated.slides,
+    createdAt: new Date().toISOString(),
+    modelUsed: process.env.OPENAI_API_KEY ? PRESENTATION_AI_MODEL : 'local-fallback'
+  };
+  decks.push(deck);
+  db.savePresentationDecks(decks);
+  consumePresentationCredit({ subscriptionId: activeSubscription.id });
+
+  return res.redirect(`/codentra-presentations/decks/${deck.id}?success=${encodeURIComponent('تم إنشاء العرض بنجاح')}`);
+});
+
+app.get('/codentra-presentations/decks/:deckId', requireAuth, (req, res) => {
+  if (!req.session.user || req.session.user.role !== 'user') return res.redirect('/');
+
+  const decks = db.presentationDecks();
+  const deck = decks.find((item) => item && item.id === req.params.deckId && item.userId === req.session.user.id);
+  if (!deck) {
+    return res.redirect('/codentra-presentations?error=' + encodeURIComponent('العرض غير موجود'));
+  }
+
+  res.render('presentations/deck', {
+    user: req.session.user,
+    deck,
+    success: req.query.success || null
+  });
+});
+
+app.get('/codentra-presentations/decks/:deckId/download.pptx', requireAuth, async (req, res, next) => {
+  if (!req.session.user || req.session.user.role !== 'user') return res.redirect('/');
+
+  try {
+    const decks = db.presentationDecks();
+    const deck = decks.find((item) => item && item.id === req.params.deckId && item.userId === req.session.user.id);
+    if (!deck) {
+      return res.redirect('/codentra-presentations?error=' + encodeURIComponent('العرض غير موجود'));
+    }
+
+    const { fileName, filePath } = await buildPresentationPptxFile(deck);
+    return res.download(filePath, fileName, () => {
+      fs.unlink(filePath, () => {});
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
 // User - Send message to admin
 app.post('/messages', requireAuth, (req, res) => {
   const { content, purchaseId } = req.body;
@@ -3567,121 +4952,59 @@ app.post('/admin/messages/:userId', requireAdmin, (req, res) => {
 });
 
 const httpServer = http.createServer(app);
-let io = null;
+const io = new Server(httpServer, {
+  cors: {
+    origin: ["http://localhost:3000", "http://192.168.8.110:3000", "*"],
+    methods: ["GET", "POST"],
+    credentials: true
+  }
+});
 
-if (!IS_VERCEL) {
-  io = new Server(httpServer, {
-    cors: {
-      origin: allowAnyCorsOrigin ? true : configuredCorsOrigins,
-      methods: ["GET", "POST"],
-      credentials: true
+io.on('connection', (socket) => {
+  socket.on('join-room', (roomId) => {
+    if (!roomId) return;
+    socket.join(roomId);
+    socket.to(roomId).emit('peer-joined');
+  });
+
+  socket.on('webrtc-offer', ({ roomId, offer }) => {
+    if (!roomId || !offer) return;
+    socket.to(roomId).emit('webrtc-offer', { offer });
+  });
+
+  socket.on('webrtc-answer', ({ roomId, answer }) => {
+    if (!roomId || !answer) return;
+    socket.to(roomId).emit('webrtc-answer', { answer });
+  });
+
+  socket.on('webrtc-ice-candidate', ({ roomId, candidate }) => {
+    if (!roomId || !candidate) return;
+    socket.to(roomId).emit('webrtc-ice-candidate', { candidate });
+  });
+
+  socket.on('leave-room', (roomId) => {
+    if (!roomId) return;
+    socket.leave(roomId);
+    socket.to(roomId).emit('peer-left');
+  });
+
+  socket.on('join-admin-team', () => {
+    socket.join('admin-team');
+  });
+
+  socket.on('admin-team-message', (payload) => {
+    try {
+      if (!payload || typeof payload !== 'object') return;
+      socket.to('admin-team').emit('admin-team-message', payload);
+    } catch (e) {
+      // ignore
     }
   });
+});
 
-  io.on('connection', (socket) => {
-    socket.on('join-room', (roomId) => {
-      if (!roomId) return;
-      socket.join(roomId);
-      socket.to(roomId).emit('peer-joined');
-    });
-
-    socket.on('webrtc-offer', ({ roomId, offer }) => {
-      if (!roomId || !offer) return;
-      socket.to(roomId).emit('webrtc-offer', { offer });
-    });
-
-    socket.on('webrtc-answer', ({ roomId, answer }) => {
-      if (!roomId || !answer) return;
-      socket.to(roomId).emit('webrtc-answer', { answer });
-    });
-
-    socket.on('webrtc-ice-candidate', ({ roomId, candidate }) => {
-      if (!roomId || !candidate) return;
-      socket.to(roomId).emit('webrtc-ice-candidate', { candidate });
-    });
-
-    socket.on('leave-room', (roomId) => {
-      if (!roomId) return;
-      socket.leave(roomId);
-      socket.to(roomId).emit('peer-left');
-    });
-
-    socket.on('join-admin-team', () => {
-      socket.join('admin-team');
-    });
-
-    socket.on('admin-team-message', (payload) => {
-      try {
-        if (!payload || typeof payload !== 'object') return;
-        socket.to('admin-team').emit('admin-team-message', payload);
-      } catch (e) {
-        // ignore
-      }
-    });
-  });
-}
-
-let shuttingDown = false;
-
-const shutdown = async (signal) => {
-  if (shuttingDown) return;
-  shuttingDown = true;
-
-  console.log(`${signal} received. Flushing pending MongoDB writes...`);
-
-  try {
-    await mongoState.waitForWrites();
-  } catch (error) {
-    console.error('Failed while waiting for MongoDB writes:', error);
-  }
-
-  try {
-    await new Promise((resolve) => {
-      if (!httpServer.listening) {
-        resolve();
-        return;
-      }
-      httpServer.close(() => resolve());
-    });
-  } catch (error) {
-    console.error('Failed to close HTTP server cleanly:', error);
-  }
-
-  try {
-    await mongoState.disconnect();
-  } catch (error) {
-    console.error('Failed to close MongoDB connection cleanly:', error);
-  }
-
-  process.exit(0);
-};
-
-if (!IS_VERCEL) {
-  ['SIGINT', 'SIGTERM'].forEach((signal) => {
-    process.on(signal, () => {
-      void shutdown(signal);
-    });
-  });
-}
-
-const startServer = async () => {
-  try {
-    await ensureAppReady();
-
-    httpServer.listen(PORT, '0.0.0.0', () => {
-      console.log(`Codentra running on http://0.0.0.0:${PORT}`);
-      console.log(`MongoDB connected: ${mongoState.isReady()}`);
-      console.log('Admin: admin@codentra.com / admin123');
-    });
-  } catch (error) {
-    console.error('Failed to start Codentra with MongoDB:', error);
-    process.exit(1);
-  }
-};
-
-if (!IS_VERCEL) {
-  void startServer();
-}
-
-module.exports = app;
-module.exports.default = app;
+// Start server
+httpServer.listen(PORT, '0.0.0.0', () => {
+  console.log(`Codentra running on http://localhost:${PORT}`);
+  console.log(`Network access: http://192.168.8.110:${PORT}`);
+  console.log(`Admin: admin@codentra.com / admin123`);
+});

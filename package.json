@@ -1,7 +1,7 @@
 {
-  "name": "codentra-vps-mongodb",
+  "name": "codentra-marketplace",
   "version": "1.0.0",
-  "description": "Codentra - MongoDB VPS deployment package with Docker",
+  "description": "Codentra - Software Company Project Marketplace",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -9,15 +9,16 @@
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
-    "connect-mongo": "^5.1.0",
     "dotenv": "^17.3.1",
     "ejs": "^3.1.9",
     "express": "^4.18.2",
     "express-session": "^1.17.3",
     "jsonwebtoken": "^9.0.3",
-    "mongoose": "^8.12.2",
     "multer": "^1.4.5-lts.1",
+    "nodemailer": "^6.10.1",
     "pdfkit": "^0.14.0",
+    "pg": "^8.20.0",
+    "pptxgenjs": "^3.12.0",
     "sharp": "^0.34.5",
     "socket.io": "^4.8.3",
     "uuid": "^9.0.0"
